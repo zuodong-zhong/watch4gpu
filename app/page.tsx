@@ -5,6 +5,13 @@ import userNames from "@/data/user-names.json";
 
 type NodeMode = "direct" | "relay";
 type AttributionSource = "pid" | "nspid" | "device" | "cuda-env" | "path" | "parent" | "node" | "account" | null;
+type AttributionEvidence = {
+  systemAccount: string | null;
+  environmentUser: string | null;
+  taskUser: string | null;
+  taskSources: string[];
+  conflict: boolean;
+};
 
 type NodeConfig = {
   id: string;
@@ -28,8 +35,10 @@ type ProcessInfo = {
   owner: string | null;
   attributedUser: string | null;
   attributionSource: AttributionSource;
+  attributionEvidence?: AttributionEvidence | null;
   elapsed: string | null;
   command: string | null;
+  cwd?: string | null;
   containerPid: number | null;
   ppid: number | null;
   pgid: number | null;
@@ -53,6 +62,7 @@ type WorkloadInfo = {
   user: string | null;
   attributedUser: string | null;
   attributionSource: "path" | "parent" | "account" | null;
+  attributionEvidence?: AttributionEvidence | null;
   pid: number;
   ppid: number;
   pgid: number;
@@ -62,6 +72,7 @@ type WorkloadInfo = {
   namespacePid: number;
   groupCount?: number;
   command: string;
+  cwd?: string | null;
   devices: number[];
 };
 
@@ -125,12 +136,6 @@ function normalizeUser(user?: string | null) {
   return user?.trim().replace(/^@/, "").toLowerCase() || "";
 }
 
-function userDisplayName(user?: string | null) {
-  const account = normalizeUser(user);
-  if (!account) return null;
-  return `@${USER_NAMES[account] || account}`;
-}
-
 function userIdentity(user?: string | null) {
   const account = normalizeUser(user);
   if (!account) return "用户不可见";
@@ -138,7 +143,43 @@ function userIdentity(user?: string | null) {
   return name ? `${name}，账号 ${account}` : `账号 ${account}`;
 }
 
+function attributedUserLabel(user?: string | null, evidence?: AttributionEvidence | null) {
+  const account = normalizeUser(user);
+  if (!account) return "用户不可见";
+  const display = USER_NAMES[account] || account;
+  return evidence?.conflict ? `可能是 @${display}` : `@${display}`;
+}
+
+function attributionEvidenceTitle(user?: string | null, evidence?: AttributionEvidence | null) {
+  if (!evidence) return null;
+  const details = [
+    evidence.systemAccount && `系统账户 ${evidence.systemAccount}`,
+    evidence.environmentUser && `环境 ${evidence.environmentUser}`,
+    evidence.taskUser && `任务目录 ${evidence.taskUser}`,
+  ].filter(Boolean).join(" / ");
+  if (evidence.conflict) {
+    return `证据存在冲突：${details}。当前仅能判断可能是 ${normalizeUser(user)}，无法由进程信息确认实际操作者。`;
+  }
+  return details ? `归属证据：${details}` : null;
+}
+
+function AttributionEvidenceList({ evidence }: { evidence?: AttributionEvidence | null }) {
+  if (!evidence?.conflict) return null;
+  const items = [
+    evidence.systemAccount && { kind: "system", label: "系统账户", value: evidence.systemAccount },
+    evidence.environmentUser && { kind: "environment", label: "环境", value: evidence.environmentUser },
+    evidence.taskUser && { kind: "task", label: "任务目录", value: evidence.taskUser },
+  ].filter((item): item is { kind: string; label: string; value: string } => Boolean(item));
+  return (
+    <span className="attribution-evidence" role="list" aria-label="进程归属证据">
+      {items.map((item) => <span className={item.kind} role="listitem" key={item.kind}><small>{item.label}</small>{item.value}</span>)}
+    </span>
+  );
+}
+
 function processAttributionTitle(process: ProcessInfo) {
+  const evidenceTitle = attributionEvidenceTitle(process.attributedUser, process.attributionEvidence);
+  if (evidenceTitle) return evidenceTitle;
   const identity = userIdentity(process.attributedUser);
   const account = process.owner ? `；系统账户 ${process.owner}` : "";
   switch (process.attributionSource) {
@@ -223,13 +264,14 @@ function GpuTile({ gpu }: { gpu: GpuInfo }) {
             <div className="process-row" key={`${gpu.uuid}-${process.pid}`}>
               <div className="process-main">
                 <span
-                  className={`process-owner ${isInferredAttribution(process.attributionSource) ? "inferred" : ""} ${process.attributedUser ? "" : "unknown"}`}
+                  className={`process-owner ${isInferredAttribution(process.attributionSource) ? "inferred" : ""} ${process.attributionEvidence?.conflict ? "conflicted" : ""} ${process.attributedUser ? "" : "unknown"}`}
                   title={processAttributionTitle(process)}
                   role="note"
                   aria-label={processAttributionTitle(process)}
-                >{userDisplayName(process.attributedUser) || "用户不可见"}{isInferredAttribution(process.attributionSource) && <small>推断</small>}</span>
+                >{attributedUserLabel(process.attributedUser, process.attributionEvidence)}{isInferredAttribution(process.attributionSource) && !process.attributionEvidence?.conflict && <small>推断</small>}</span>
                 <span className="process-name" title={process.command || process.name}>{process.name.split("/").pop()}</span>
               </div>
+              <AttributionEvidenceList evidence={process.attributionEvidence} />
               <div className="process-meta">
                 <code>PID {process.pid}</code>
                 <span>{process.elapsed ? `已运行 ${process.elapsed}` : "时长未知"}</span>
@@ -251,11 +293,16 @@ function WorkloadDetails({ workloads }: { workloads: WorkloadInfo[] }) {
       <div className="workload-rows">
         {workloads.slice(0, 12).map((workload) => (
           <div className="workload-row" key={`${workload.pid}-${workload.command}`}>
-            <span className={`process-owner ${workload.attributionSource === "path" || workload.attributionSource === "parent" ? "inferred" : ""}`}>{userDisplayName(workload.attributedUser || workload.user) || "未知"}</span>
+            <span
+              className={`process-owner ${workload.attributionSource === "path" || workload.attributionSource === "parent" ? "inferred" : ""} ${workload.attributionEvidence?.conflict ? "conflicted" : ""}`}
+              title={attributionEvidenceTitle(workload.attributedUser || workload.user, workload.attributionEvidence) || undefined}
+              role="note"
+            >{attributedUserLabel(workload.attributedUser || workload.user, workload.attributionEvidence)}</span>
             <code>PID {workload.pid}</code>
             {workload.devices.length > 0 && <span className="workload-gpu">GPU {workload.devices.join(",")}</span>}
             <span className="workload-command" title={workload.command}>{workload.command}</span>
             <span>{workload.elapsed}</span>
+            <AttributionEvidenceList evidence={workload.attributionEvidence} />
           </div>
         ))}
       </div>

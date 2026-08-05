@@ -34,6 +34,7 @@ yarn-error.log*
 
 # local cluster configuration
 /data/nodes.local.json
+/data/deep-inspection-users.local.json
 
 # vercel
 .vercel

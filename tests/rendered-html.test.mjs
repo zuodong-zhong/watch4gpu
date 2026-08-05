@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
+
+const REPOSITORY_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -58,6 +62,14 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   assert.doesNotMatch(page, /process-details/);
   assert.doesNotMatch(page, /等 \$\{gpu\.processes\.length\} 个进程/);
   assert.match(page, /<div className="processes">/);
+  assert.match(page, /可能是 @\$\{display\}/);
+  assert.match(page, /系统账户 \$\{evidence\.systemAccount\}/);
+  assert.match(page, /环境 \$\{evidence\.environmentUser\}/);
+  assert.match(page, /任务目录 \$\{evidence\.taskUser\}/);
+  assert.match(page, /className="attribution-evidence"/);
+  assert.match(page, /label: "系统账户"/);
+  assert.match(page, /label: "环境"/);
+  assert.match(page, /label: "任务目录"/);
   assert.match(page, /<MetricRing value=\{gpu\.utilization\} label="利用率" \/>/);
   assert.match(page, /<MetricRing value=\{memoryPercent\} label="显存" \/>/);
   assert.doesNotMatch(page, /metric-pointer/);
@@ -66,6 +78,8 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   assert.match(css, /\.metric-ring \{[^}]*width:\s*76px/);
   assert.match(css, /\.memory-copy \{[^}]*justify-self:\s*end;[^}]*text-align:\s*right/);
   assert.match(css, /\.process-owner \{[^}]*font:\s*600 12px\/18px/);
+  assert.match(css, /\.process-owner\.conflicted \{/);
+  assert.match(css, /\.attribution-evidence \{/);
   assert.match(css, /\.modal-head > button \{[\s\S]*?width: 44px;[\s\S]*?height: 44px;/);
   assert.match(css, /\.collection-popover \{/);
   assert.match(css, /\.collection-options button\.active \{/);
@@ -77,9 +91,9 @@ test("protects keyboard, mobile, and local development behavior", async () => {
 });
 
 test("keeps the public defaults free of private cluster configuration", async () => {
-  const [nodesText, namesText, page, server, readme, login] = await Promise.all([
-    readFile(new URL("../data/nodes.json", import.meta.url), "utf8"),
-    readFile(new URL("../data/user-names.json", import.meta.url), "utf8"),
+  const nodesText = execFileSync("git", ["show", "HEAD:data/nodes.json"], { cwd: REPOSITORY_ROOT, encoding: "utf8" });
+  const namesText = execFileSync("git", ["show", "HEAD:data/user-names.json"], { cwd: REPOSITORY_ROOT, encoding: "utf8" });
+  const [page, server, readme, login] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../README.md", import.meta.url), "utf8"),

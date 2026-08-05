@@ -142,9 +142,12 @@ NEXT_PUBLIC_WATCH4GPU_USER_NAMES={"alice":"Alice","bob":"Bob"}
 | `NEXT_PUBLIC_WATCH4GPU_API_URL` | `http://127.0.0.1:8787` | 前端访问的 API 地址 |
 | `NEXT_PUBLIC_WATCH4GPU_USER_NAMES` | 空 | JSON 格式的账号到显示名称映射 |
 | `WATCH4GPU_USER_PATH_PREFIXES` | 空 | 用于推断进程归属的共享目录前缀，逗号分隔，例如 `/shared/users,/data/team` |
+| `WATCH4GPU_DEEP_INSPECTION_USERS` | 空（始终包含 `root`） | 需要触发容器只读深度归属检查的额外共享账户，逗号分隔 |
 | `WATCH4GPU_EXPECT_SCRIPT` | `~/connect.exp` | 网关上的 expect 脚本路径，由 `login.sh` 使用 |
 
 本地 API 默认只监听 `127.0.0.1`，不要把它直接暴露到公网。开发环境自动允许来自 `localhost`、`127.0.0.1` 和 `::1` 的页面；只有确有需要时才配置额外来源。
+
+共享账户名单也可以放在不会提交的 `data/deep-inspection-users.local.json` 中，格式为 `{ "users": ["shared-account"] }`。名单只决定是否启动只读深度采集，不会直接决定进程归属。
 
 ## 常用命令
 
