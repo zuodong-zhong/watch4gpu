@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -11,6 +11,8 @@ const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCH4GPU_API_PORT || 8787);
 const SSH_TIMEOUT_MS = Number(process.env.WATCH4GPU_SSH_TIMEOUT_MS || 25000);
 const RELAY_TIMEOUT_MS = Number(process.env.WATCH4GPU_RELAY_TIMEOUT_MS || 45000);
+const MIN_TIMEOUT_SECONDS = 5;
+const MAX_TIMEOUT_SECONDS = 120;
 const configuredOrigins = new Set(
   (process.env.WATCH4GPU_ALLOWED_ORIGINS || "")
     .split(",")
@@ -50,16 +52,22 @@ const namespaceQuery = [
   "case \"$nspids\" in *,*) cmd=${cmd:0:700}; printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$user\" \"$pid\" \"$ppid\" \"$pgid\" \"$sid\" \"$elapsed\" \"$nspids\" \"$cmd\";; esac;",
   "done | head -n 256",
 ].join(" ");
+const deviceProcessMarker = "__WATCH4GPU_DEVICE_PROCESSES__";
 const deviceQuery = [
+  "unique_pids=' ';",
   "for device in /dev/nvidia[0-9]*; do test -e \"$device\" || continue; gpu_index=${device#/dev/nvidia}; pids=; method=;",
   "if command -v fuser >/dev/null 2>&1; then pids=$(fuser \"$device\" 2>/dev/null); method=fuser; fi;",
   "if test -z \"$pids\" && command -v lsof >/dev/null 2>&1; then pids=$(lsof -t \"$device\" 2>/dev/null | sort -u); method=lsof; fi;",
   "for pid in $pids; do case \"$pid\" in ''|*[!0-9]*) continue;; esac;",
-  "user=$(ps -o user= -p \"$pid\" 2>/dev/null | awk '{print $1}'); test -n \"$user\" || continue;",
-  "elapsed=$(ps -o etime= -p \"$pid\" 2>/dev/null | awk '{print $1}');",
+  "printf '%s\\t%s\\t%s\\n' \"$gpu_index\" \"$pid\" \"$method\";",
+  "case \"$unique_pids\" in *\" $pid \"*) ;; *) unique_pids=\"${unique_pids}${pid} \";; esac;",
+  "done; done;",
+  `printf '%s\\n' '${deviceProcessMarker}';`,
+  "for pid in $unique_pids; do",
   "nspids=$(awk '/^NSpid:/{for(i=2;i<=NF;i++) printf \"%s%s\", (i==2?\"\":\",\"), $i}' /proc/\"$pid\"/status 2>/dev/null);",
-  "cmd=$(ps -ww -o args= -p \"$pid\" 2>/dev/null); cmd=${cmd:0:700};",
-  "printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$gpu_index\" \"$pid\" \"$method\" \"$user\" \"$elapsed\" \"$nspids\" \"$cmd\"; done; done",
+  "ps -ww -p \"$pid\" -o user= -o etime= -o args= 2>/dev/null",
+  "| awk -v pid=\"$pid\" -v nspids=\"$nspids\" '{user=$1; elapsed=$2; sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]*/, \"\"); cmd=substr($0,1,700); printf \"%s\\t%s\\t%s\\t%s\\t%s\\n\", pid, user, elapsed, nspids, cmd}';",
+  "done",
 ].join(" ");
 const remoteProbe = `printf '__WATCH4GPU_HOST__\\n'; hostname; printf '__WATCH4GPU_GPUS__\\n'; ${gpuQuery}; printf '__WATCH4GPU_PROCESSES__\\n'; ${processQuery}; printf '__WATCH4GPU_OWNERS__\\n'; ${ownerQuery}; printf '__WATCH4GPU_WORKLOADS__\\n'; ${workloadQuery}; printf '__WATCH4GPU_NAMESPACES__\\n'; ${namespaceQuery}; printf '__WATCH4GPU_DEVICES__\\n'; ${deviceQuery}; printf '__WATCH4GPU_DONE__\\n'`;
 
@@ -116,7 +124,17 @@ function validateNodes(value) {
   });
 }
 
-function run(command, args, input) {
+function parseTimeoutMs(value) {
+  if (value == null) return null;
+  if (!/^\d+$/.test(value)) throw new Error("超时时间必须为整数秒");
+  const seconds = Number(value);
+  if (seconds < MIN_TIMEOUT_SECONDS || seconds > MAX_TIMEOUT_SECONDS) {
+    throw new Error(`超时时间必须在 ${MIN_TIMEOUT_SECONDS}–${MAX_TIMEOUT_SECONDS} 秒之间`);
+  }
+  return seconds * 1000;
+}
+
+function run(command, args, input, timeoutMs = SSH_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: [input ? "pipe" : "ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -127,8 +145,8 @@ function run(command, args, input) {
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 1000).unref();
       settled = true;
-      reject(new Error(`连接超时（${Math.round(SSH_TIMEOUT_MS / 1000)} 秒）`));
-    }, SSH_TIMEOUT_MS);
+      reject(new Error(`连接超时（${Math.round(timeoutMs / 1000)} 秒）`));
+    }, timeoutMs);
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => {
@@ -158,7 +176,7 @@ function stripTerminalCodes(value) {
     .replace(/\r/g, "");
 }
 
-function runRelay(node) {
+function runRelay(node, timeoutMs = RELAY_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const args = ["-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", node.gatewayHost, `bash ${node.loginScript} ${node.gpuNodeId}`];
     const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
@@ -173,7 +191,7 @@ function runRelay(node) {
       child.kill("SIGTERM");
       if (error) reject(error); else resolve(value);
     };
-    const timer = setTimeout(() => finish(new Error(`中转连接超时（${Math.round(RELAY_TIMEOUT_MS / 1000)} 秒）`)), RELAY_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(new Error(`中转连接超时（${Math.round(timeoutMs / 1000)} 秒）`)), timeoutMs);
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
       const clean = stripTerminalCodes(stdout);
@@ -281,6 +299,9 @@ function parseProbe(output) {
   const workloadPart = workloadStart >= 0 && namespaceStart > workloadStart ? output.slice(workloadStart + workloadMarker.length, namespaceStart) : "";
   const namespacePart = namespaceStart >= 0 && deviceStart > namespaceStart ? output.slice(namespaceStart + namespaceMarker.length, deviceStart) : "";
   const devicePart = deviceStart >= 0 && doneStart > deviceStart ? output.slice(deviceStart + deviceMarker.length, doneStart) : "";
+  const deviceProcessStart = devicePart.indexOf(deviceProcessMarker);
+  const deviceMapPart = deviceProcessStart >= 0 ? devicePart.slice(0, deviceProcessStart) : "";
+  const deviceProcessPart = deviceProcessStart >= 0 ? devicePart.slice(deviceProcessStart + deviceProcessMarker.length) : "";
   const owners = new Map();
   for (const line of ownerPart.split(/\r?\n/)) {
     const match = line.match(/^\s*(\S+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/);
@@ -372,13 +393,14 @@ function parseProbe(output) {
       if (namespacePid !== evidence.pid) addCandidate(namespaceCandidates, namespacePid, evidence);
     }
   }
-  for (const line of devicePart.split(/\r?\n/)) {
-    const [gpuIndex, pid, method, user, elapsed, namespacePidsValue, ...commandParts] = line.split("\t");
-    if (!/^\d+$/.test(gpuIndex || "") || !/^\d+$/.test(pid || "")) continue;
+  const deviceProcesses = new Map();
+  for (const line of deviceProcessPart.split(/\r?\n/)) {
+    const [pid, user, elapsed, namespacePidsValue, ...commandParts] = line.split("\t");
+    if (!/^\d+$/.test(pid || "") || !user) continue;
     const namespacePids = parseNamespacePids(namespacePidsValue);
     const command = commandParts.join("\t");
     const inferredUser = inferUserFromCommand(command);
-    addCandidate(deviceCandidates, Number(gpuIndex), {
+    deviceProcesses.set(Number(pid), {
       user,
       pid: Number(pid),
       ppid: null,
@@ -389,10 +411,16 @@ function parseProbe(output) {
       hostPid: namespacePids[0] || Number(pid),
       namespacePid: namespacePids.at(-1) || Number(pid),
       command,
-      deviceMethod: method,
       attributedUser: inferredUser || user || null,
       attributionSource: inferredUser ? "path" : user ? "account" : null,
     });
+  }
+  for (const line of deviceMapPart.split(/\r?\n/)) {
+    const [gpuIndex, pid, method] = line.split("\t");
+    if (!/^\d+$/.test(gpuIndex || "") || !/^\d+$/.test(pid || "")) continue;
+    const process = deviceProcesses.get(Number(pid));
+    if (!process) continue;
+    addCandidate(deviceCandidates, Number(gpuIndex), { ...process, deviceMethod: method });
   }
   const inferredWorkloadUsers = new Set(
     workloads
@@ -473,15 +501,16 @@ function parseProbe(output) {
   return { hostname: hostPart.trim().split(/\r?\n/).filter(Boolean).at(-1), gpus, workloads };
 }
 
-async function probe(node) {
+async function probe(node, requestedTimeoutMs = null) {
   const started = Date.now();
   try {
     let output;
+    const timeoutMs = requestedTimeoutMs ?? (node.mode === "relay" ? RELAY_TIMEOUT_MS : SSH_TIMEOUT_MS);
     const common = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"];
     if (node.mode === "direct") {
-      output = await run("ssh", [...common, "-p", String(node.port || 22), node.sshHost, remoteProbe]);
+      output = await run("ssh", [...common, "-p", String(node.port || 22), node.sshHost, remoteProbe], undefined, timeoutMs);
     } else {
-      output = await runRelay(node);
+      output = await runRelay(node, timeoutMs);
     }
     const parsed = parseProbe(output);
     return { nodeId: node.id, ok: true, checkedAt: new Date().toISOString(), latencyMs: Date.now() - started, ...parsed };
@@ -504,9 +533,10 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && url.pathname === "/api/status") {
       const config = await readConfig();
       const requestedNode = url.searchParams.get("node");
+      const requestedTimeoutMs = parseTimeoutMs(url.searchParams.get("timeoutSeconds"));
       const enabled = config.nodes.filter((node) => node.enabled !== false && (!requestedNode || node.id === requestedNode));
       if (requestedNode && enabled.length === 0) return json(response, 404, { error: `找不到已启用的节点：${requestedNode}` });
-      const statuses = await Promise.all(enabled.map(probe));
+      const statuses = await Promise.all(enabled.map((node) => probe(node, requestedTimeoutMs)));
       return json(response, 200, { statuses });
     }
     if (request.method === "PUT" && url.pathname === "/api/nodes") {
@@ -526,4 +556,8 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(PORT, HOST, () => console.log(`GPU Watch API: http://${HOST}:${PORT}`));
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  server.listen(PORT, HOST, () => console.log(`GPU Watch API: http://${HOST}:${PORT}`));
+}
+
+export { deviceQuery, parseProbe, parseTimeoutMs, remoteProbe };

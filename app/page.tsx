@@ -88,6 +88,21 @@ const USER_NAMES: Record<string, string> = (() => {
     return userNames;
   }
 })();
+const DEFAULT_TIMEOUT_SECONDS = 45;
+const TIMEOUT_STORAGE_KEY = "watch4gpu.timeoutSeconds";
+const TIMEOUT_OPTIONS = [
+  { seconds: 15, label: "快速" },
+  { seconds: 25, label: "标准" },
+  { seconds: 45, label: "稳妥" },
+  { seconds: 60, label: "宽松" },
+  { seconds: 90, label: "最长" },
+];
+const REFRESH_OPTIONS = [
+  { seconds: 10, label: "频繁" },
+  { seconds: 30, label: "标准" },
+  { seconds: 60, label: "省心" },
+  { seconds: 0, label: "手动" },
+];
 const emptyNode: NodeConfig = {
   id: "",
   name: "",
@@ -249,6 +264,94 @@ function WorkloadDetails({ workloads }: { workloads: WorkloadInfo[] }) {
   );
 }
 
+function CollectionPicker({
+  id,
+  label,
+  value,
+  options,
+  icon,
+  helperText,
+  disabled = false,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  options: { seconds: number; label: string }[];
+  icon: "refresh" | "timeout";
+  helperText: string;
+  disabled?: boolean;
+  onChange: (seconds: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const controlRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const displayValue = value === 0 ? "暂停" : `${value} 秒`;
+
+  useEffect(() => {
+    if (!open) return;
+    const focusTimer = window.requestAnimationFrame(() => {
+      popoverRef.current?.querySelector<HTMLButtonElement>(`[data-value="${value}"]`)?.focus();
+    });
+    function closeMenu(event: PointerEvent) {
+      if (!controlRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      triggerRef.current?.focus();
+    }
+    document.addEventListener("pointerdown", closeMenu);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusTimer);
+      document.removeEventListener("pointerdown", closeMenu);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open, value]);
+
+  function choose(seconds: number) {
+    onChange(seconds);
+    setOpen(false);
+    window.requestAnimationFrame(() => triggerRef.current?.focus());
+  }
+
+  return <div className="collection-picker" ref={controlRef}>
+    <span>{label}</span>
+    <button
+      className="collection-trigger"
+      type="button"
+      ref={triggerRef}
+      disabled={disabled}
+      aria-label={`${label}：${displayValue}`}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      aria-controls={id}
+      onClick={() => setOpen((current) => !current)}
+    >
+      <span className={`picker-icon ${icon}`} aria-hidden="true" />
+      <strong>{value === 0 ? "暂停" : <>{value}<small>秒</small></>}</strong>
+      <span className={`picker-chevron ${open ? "open" : ""}`} aria-hidden="true">⌄</span>
+    </button>
+    {open && <div className="collection-popover" id={id} ref={popoverRef} role="dialog" aria-label={`设置${label}`}>
+      <div className="collection-popover-copy"><strong>{label}</strong><span>{icon === "refresh" ? "选择数据自动更新频率" : "单个节点的最长等待时间"}</span></div>
+      <div className={`collection-options options-${options.length}`} role="group" aria-label={label}>
+        {options.map((option) => <button
+          type="button"
+          key={option.seconds}
+          data-value={option.seconds}
+          className={value === option.seconds ? "active" : ""}
+          aria-pressed={value === option.seconds}
+          onClick={() => choose(option.seconds)}
+        ><strong>{option.seconds === 0 ? "暂停" : <>{option.seconds}<small>秒</small></>}</strong><span>{option.label}</span></button>)}
+      </div>
+      <p>{helperText}</p>
+    </div>}
+  </div>;
+}
+
 export default function Home() {
   const [nodes, setNodes] = useState<NodeConfig[]>([]);
   const [statuses, setStatuses] = useState<Record<string, NodeStatus>>({});
@@ -258,6 +361,8 @@ export default function Home() {
   const [statusError, setStatusError] = useState("");
   const [query, setQuery] = useState("");
   const [intervalSeconds, setIntervalSeconds] = useState(30);
+  const [timeoutSeconds, setTimeoutSeconds] = useState(DEFAULT_TIMEOUT_SECONDS);
+  const [settingsReady, setSettingsReady] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
@@ -268,6 +373,7 @@ export default function Home() {
   const [deleting, setDeleting] = useState(false);
   const modalRef = useRef<HTMLElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const timeoutSecondsRef = useRef(DEFAULT_TIMEOUT_SECONDS);
 
   const loadNodes = useCallback(async () => {
     try {
@@ -281,10 +387,11 @@ export default function Home() {
     }
   }, []);
 
-  const refresh = useCallback(async (silent = false) => {
+  const refresh = useCallback(async (silent = false, timeoutOverride?: number) => {
     if (!silent) setRefreshing(true);
     try {
-      const response = await fetch(`${API}/api/status`, { cache: "no-store" });
+      const params = new URLSearchParams({ timeoutSeconds: String(timeoutOverride ?? timeoutSecondsRef.current) });
+      const response = await fetch(`${API}/api/status?${params}`, { cache: "no-store" });
       if (!response.ok) throw new Error("刷新失败");
       const data = await response.json();
       const next = Object.fromEntries((data.statuses as NodeStatus[]).map((item) => [item.nodeId, item]));
@@ -300,9 +407,26 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const stored = Number(window.localStorage.getItem(TIMEOUT_STORAGE_KEY));
+        if (TIMEOUT_OPTIONS.some((option) => option.seconds === stored)) {
+          timeoutSecondsRef.current = stored;
+          setTimeoutSeconds(stored);
+        }
+      } catch {
+        // Local storage can be unavailable in privacy-restricted browser contexts.
+      }
+      setSettingsReady(true);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!settingsReady) return;
     const timer = window.setTimeout(() => { void Promise.all([loadNodes(), refresh()]); }, 0);
     return () => window.clearTimeout(timer);
-  }, [loadNodes, refresh]);
+  }, [loadNodes, refresh, settingsReady]);
 
   useEffect(() => {
     if (!intervalSeconds) return;
@@ -429,6 +553,17 @@ export default function Home() {
     }
   }
 
+  function chooseTimeout(seconds: number) {
+    timeoutSecondsRef.current = seconds;
+    setTimeoutSeconds(seconds);
+    try {
+      window.localStorage.setItem(TIMEOUT_STORAGE_KEY, String(seconds));
+    } catch {
+      // Keep the in-memory choice even when persistence is unavailable.
+    }
+    void refresh(false, seconds);
+  }
+
   function nodeState(node: NodeConfig, status?: NodeStatus) {
     if (!node.enabled) return { label: "已停用", tone: "disabled" };
     if (!status) return { label: "正在连接", tone: "connecting" };
@@ -461,7 +596,10 @@ export default function Home() {
           <div><span>在线节点</span><strong>{onlineCount}<small> / {enabledNodes.length}</small></strong></div>
           <div><span>平均利用率</span><strong>{avgUtil}<small>%</small></strong></div>
         </div>
-        <label className="refresh-select"><span>自动刷新</span><select aria-label="自动刷新间隔" value={intervalSeconds} onChange={(event) => setIntervalSeconds(Number(event.target.value))}><option value={10}>10 秒</option><option value={30}>30 秒</option><option value={60}>60 秒</option><option value={0}>暂停</option></select></label>
+        <div className="collection-controls" aria-label="采集设置">
+          <CollectionPicker id="refresh-menu" label="自动刷新" value={intervalSeconds} options={REFRESH_OPTIONS} icon="refresh" helperText="暂停后仍可使用顶部按钮手动刷新。" onChange={setIntervalSeconds} />
+          <CollectionPicker id="timeout-menu" label="超时上限" value={timeoutSeconds} options={TIMEOUT_OPTIONS} icon="timeout" helperText="较慢的中转节点建议选择 45 秒以上。" disabled={!settingsReady} onChange={chooseTimeout} />
+        </div>
       </section>
 
       {serviceError && nodes.length > 0 && <div className="notice" role="alert"><span aria-hidden="true">!</span><div><strong>暂时无法刷新</strong><p>继续显示上次成功采集的数据。</p></div><button onClick={() => { void loadNodes(); void refresh(); }}>重试</button></div>}

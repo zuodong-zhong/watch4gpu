@@ -45,6 +45,12 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   ]);
 
   assert.match(page, /event\.key === "Escape"/);
+  assert.match(page, /TIMEOUT_STORAGE_KEY/);
+  assert.match(page, /REFRESH_OPTIONS/);
+  assert.match(page, /new URLSearchParams\(\{ timeoutSeconds:/);
+  assert.match(page, /aria-haspopup="dialog"/);
+  assert.match(page, /暂停后仍可使用顶部按钮手动刷新/);
+  assert.match(page, /较慢的中转节点建议选择 45 秒以上/);
   assert.match(page, /focusableSelector/);
   assert.match(page, /previousFocusRef\.current\?\.focus/);
   assert.match(page, /aria-modal="true"/);
@@ -61,6 +67,8 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   assert.match(css, /\.memory-copy \{[^}]*justify-self:\s*end;[^}]*text-align:\s*right/);
   assert.match(css, /\.process-owner \{[^}]*font:\s*600 12px\/18px/);
   assert.match(css, /\.modal-head > button \{[\s\S]*?width: 44px;[\s\S]*?height: 44px;/);
+  assert.match(css, /\.collection-popover \{/);
+  assert.match(css, /\.collection-options button\.active \{/);
   assert.doesNotMatch(css, /\.top-actions select\s*\{\s*display:\s*none/);
   assert.doesNotMatch(css, /\.top-actions \.primary::after/);
   assert.match(server, /WATCH4GPU_ALLOWED_ORIGINS/);
