@@ -17,6 +17,7 @@ test("device query emits every GPU-PID mapping and queries unique PID metadata s
   assert.match(deviceQuery, /printf '%s\\t%s\\t%s\\n' \"\$gpu_index\" \"\$pid\" \"\$method\"/);
   assert.match(deviceQuery, /case \"\$unique_pids\" in \*\" \$pid \"\*/);
   assert.match(deviceQuery, /__WATCH4GPU_DEVICE_PROCESSES__/);
+  assert.match(deviceQuery, /-o ppid= -o pgid= -o sid=/);
   assert.equal((deviceQuery.match(/ps -ww -p/g) || []).length, 1);
 });
 
@@ -63,7 +64,7 @@ test("parseProbe associates one PID's metadata with every mapped GPU", () => {
     "0\t4242\tfuser",
     "1\t4242\tfuser",
     "__WATCH4GPU_DEVICE_PROCESSES__",
-    "4242\troot\t01:23:45\t4242,17\t/home/alice/project\tpython /home/alice/train.py",
+    "4242\troot\t1\t4242\t4242\t01:23:45\t4242,17\t/home/alice/project\tpython /home/alice/train.py",
     "__WATCH4GPU_DONE__",
     "",
   ].join("\n");
@@ -148,7 +149,7 @@ test("uses a container cwd when host proc permissions hide the task directory", 
     "__WATCH4GPU_NAMESPACES__",
     "__WATCH4GPU_DEVICES__",
     "__WATCH4GPU_DEVICE_PROCESSES__",
-    `44468\troot\t18:21:11\t44468,30765\t\t${command}`,
+    `44468\troot\t43737\t44468\t11180\t18:21:11\t44468,30765\t\t${command}`,
     "__WATCH4GPU_CONTAINER_CWDS__",
     `aaaaaaaaaaaa\t30765\t/public/task_owner/project\t${command}`,
     "__WATCH4GPU_DONE__",
@@ -173,6 +174,132 @@ test("uses a container cwd when host proc permissions hide the task directory", 
   assert.deepEqual(process.attributionEvidence, workload.attributionEvidence);
   assert.equal(ownerOnlyProcess.attributedUser, "task_owner");
   assert.deepEqual(ownerOnlyProcess.attributionEvidence, workload.attributionEvidence);
+});
+
+test("attributes renamed vLLM GPU workers through their process group", () => {
+  const launchCommand = "/usr/bin/python3 /usr/local/bin/vllm serve /9950backfile/task_owner/models/example --tensor-parallel-size 2";
+  const unrelatedCommand = "/usr/bin/python3 /usr/local/bin/vllm serve /public/other_owner/models/example --tensor-parallel-size 2";
+  const output = [
+    "__WATCH4GPU_HOST__",
+    "gpu-host",
+    "__WATCH4GPU_GPUS__",
+    "0, NVIDIA A100, GPU-0, 42, 80, 4096, 81920, 200, 400",
+    "1, NVIDIA A100, GPU-1, 43, 75, 4096, 81920, 190, 400",
+    "__WATCH4GPU_PROCESSES__",
+    "GPU-0, 9464, VLLM::Worker_TP0, 2048",
+    "GPU-1, 9465, VLLM::Worker_TP1, 2048",
+    "__WATCH4GPU_OWNERS__",
+    "root 9464 01:53:26 VLLM::Worker_TP0",
+    "root 9465 01:53:26 VLLM::Worker_TP1",
+    "__WATCH4GPU_WORKLOADS__",
+    `root\t8984\t22436\t8984\t22436\t01:53:50\t\t/9950backfile/task_owner/project\t0,1\t-\t-\t-\t${launchCommand}`,
+    `root\t7000\t1\t7000\t7000\t00:20:00\t\t/public/other_owner/project\t0,1\t-\t-\t-\t${unrelatedCommand}`,
+    "__WATCH4GPU_NAMESPACES__",
+    "__WATCH4GPU_DEVICES__",
+    "0\t9464\tfuser",
+    "1\t9465\tfuser",
+    "__WATCH4GPU_DEVICE_PROCESSES__",
+    "9464\troot\t9265\t8984\t22436\t01:53:26\t\t\tVLLM::Worker_TP0",
+    "9465\troot\t9265\t8984\t22436\t01:53:26\t\t\tVLLM::Worker_TP1",
+    "__WATCH4GPU_DONE__",
+    "",
+  ].join("\n");
+
+  const result = parseProbe(output);
+  const gpuProcesses = result.gpus.map((gpu) => gpu.processes[0]);
+
+  assert.deepEqual(gpuProcesses.map((process) => process.attributedUser), ["task_owner", "task_owner"]);
+  assert.deepEqual(gpuProcesses.map((process) => process.attributionSource), ["parent", "parent"]);
+  assert.deepEqual(gpuProcesses.map((process) => process.owner), ["root", "root"]);
+  assert.deepEqual(gpuProcesses.map((process) => process.attributionEvidence.taskUser), ["task_owner", "task_owner"]);
+});
+
+test("uses GPU-scoped weak evidence instead of another user's node-wide fallback", () => {
+  const environmentCommand = "/public/environment_owner/envs/train/bin/python -u train.py";
+  const taskCommand = "/public/shared_env/envs/train/bin/python -u train.py --output /9950backfile/task_owner/outputs";
+  const output = [
+    "__WATCH4GPU_HOST__",
+    "gpu-host",
+    "__WATCH4GPU_GPUS__",
+    "0, NVIDIA A100, GPU-0, 42, 80, 4096, 81920, 200, 400",
+    "4, NVIDIA A100, GPU-4, 43, 75, 4096, 81920, 190, 400",
+    "__WATCH4GPU_PROCESSES__",
+    "GPU-0, 23071, [Not Found], 2048",
+    "GPU-4, 25702, [Not Found], 2048",
+    "__WATCH4GPU_OWNERS__",
+    "__WATCH4GPU_WORKLOADS__",
+    `root\t22708\t21943\t22708\t22708\t02:07:50\t\t/storage-root/datasets/shared/code/project\t0\t0\t0\t4\t${environmentCommand}`,
+    `root\t63896\t63893\t63893\t37497\t2-10:49:08\t\t/storage-root/datasets/shared/code/other\t4\t-\t-\t-\t${taskCommand}`,
+    "__WATCH4GPU_NAMESPACES__",
+    "__WATCH4GPU_DEVICES__",
+    "__WATCH4GPU_DEVICE_PROCESSES__",
+    "__WATCH4GPU_DONE__",
+    "",
+  ].join("\n");
+
+  const result = parseProbe(output);
+  const gpuZeroProcess = result.gpus.find((gpu) => gpu.index === 0).processes[0];
+
+  assert.equal(gpuZeroProcess.attributedUser, "environment_owner");
+  assert.equal(gpuZeroProcess.attributionSource, "cuda-env");
+  assert.equal(gpuZeroProcess.attributionEvidence.environmentUser, "environment_owner");
+  assert.equal(gpuZeroProcess.attributionEvidence.taskUser, null);
+  assert.notEqual(gpuZeroProcess.attributedUser, "task_owner");
+});
+
+test("maps local ranks to GPUs when CUDA_VISIBLE_DEVICES is unset", () => {
+  const command = "/public/rank_owner/envs/train/bin/python -u train.py --output /public/rank_owner/outputs";
+  const output = [
+    "__WATCH4GPU_HOST__",
+    "gpu-host",
+    "__WATCH4GPU_GPUS__",
+    "0, NVIDIA A100, GPU-0, 42, 80, 4096, 81920, 200, 400",
+    "1, NVIDIA A100, GPU-1, 43, 75, 4096, 81920, 190, 400",
+    "__WATCH4GPU_PROCESSES__",
+    "GPU-0, 35685, [Not Found], 2048",
+    "GPU-1, 35686, [Not Found], 2048",
+    "__WATCH4GPU_OWNERS__",
+    "__WATCH4GPU_WORKLOADS__",
+    `root\t17863\t17798\t17863\t17863\t02:07:50\t\t/storage-root/datasets/shared/project\t-\t0\t0\t2\t${command}`,
+    `root\t17864\t17798\t17864\t17864\t02:07:50\t\t/storage-root/datasets/shared/project\t-\t1\t1\t2\t${command}`,
+    "__WATCH4GPU_NAMESPACES__",
+    "__WATCH4GPU_DEVICES__",
+    "__WATCH4GPU_DEVICE_PROCESSES__",
+    "__WATCH4GPU_DONE__",
+    "",
+  ].join("\n");
+
+  const result = parseProbe(output);
+
+  assert.deepEqual(result.workloads.map((workload) => workload.physicalGpu), [0, 1]);
+  assert.deepEqual(result.workloads.map((workload) => workload.devices), [[0], [1]]);
+  assert.deepEqual(result.gpus.map((gpu) => gpu.processes[0].attributedUser), ["rank_owner", "rank_owner"]);
+  assert.deepEqual(result.gpus.map((gpu) => gpu.processes[0].attributionSource), ["cuda-env", "cuda-env"]);
+});
+
+test("leaves an invisible GPU PID unknown when no GPU-scoped relation exists", () => {
+  const command = "/public/task_owner/envs/train/bin/python -u train.py --output /public/task_owner/outputs";
+  const output = [
+    "__WATCH4GPU_HOST__",
+    "gpu-host",
+    "__WATCH4GPU_GPUS__",
+    "0, NVIDIA A100, GPU-0, 42, 80, 4096, 81920, 200, 400",
+    "__WATCH4GPU_PROCESSES__",
+    "GPU-0, 99999, [Not Found], 2048",
+    "__WATCH4GPU_OWNERS__",
+    "__WATCH4GPU_WORKLOADS__",
+    `root\t7000\t1\t7000\t7000\t00:20:00\t\t/public/task_owner/project\t-\t-\t-\t-\t${command}`,
+    "__WATCH4GPU_NAMESPACES__",
+    "__WATCH4GPU_DEVICES__",
+    "__WATCH4GPU_DEVICE_PROCESSES__",
+    "__WATCH4GPU_DONE__",
+    "",
+  ].join("\n");
+
+  const process = parseProbe(output).gpus[0].processes[0];
+
+  assert.equal(process.attributedUser, null);
+  assert.equal(process.attributionSource, null);
 });
 
 test("does not guess a task user when identical container commands have different working directories", () => {

@@ -50,9 +50,10 @@ const configuredDeepInspectionUsers = [
 const gpuQuery = "nvidia-smi --query-gpu=index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,power.limit --format=csv,noheader,nounits";
 const processQuery = "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true";
 const ownerQuery = "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | while IFS= read -r pid; do ps -ww -p \"$pid\" -o user= -o pid= -o etime= -o args= 2>/dev/null; done";
+const workloadProcessPattern = "[t]orchrun|[d]eepspeed|[a]ccelerate|[p]ython|[s]wift|[vV][lL][lL][mM]";
 const workloadQuery = [
   "ps -ww -e -o user= -o pid= -o ppid= -o pgid= -o sid= -o etime= -o args=",
-  "| grep -E '[t]orchrun|[d]eepspeed|[a]ccelerate|[p]ython|[s]wift'",
+  `| grep -E '${workloadProcessPattern}'`,
   "| grep -Ev 'client_start\\.py|server_start\\.py|fake_cmd|/nvitop|/gpustat|torch/_inductor/compile_worker'",
   "| while read -r user pid ppid pgid sid elapsed cmd; do",
   "nspids=$(awk '/^NSpid:/{for(i=2;i<=NF;i++) printf \"%s%s\", (i==2?\"\":\",\"), $i}' /proc/\"$pid\"/status 2>/dev/null);",
@@ -66,7 +67,7 @@ const workloadQuery = [
 ].join(" ");
 const namespaceQuery = [
   "ps -ww -e -o user= -o pid= -o ppid= -o pgid= -o sid= -o etime= -o args=",
-  "| grep -E '[t]orchrun|[d]eepspeed|[a]ccelerate|[p]ython|[s]wift'",
+  `| grep -E '${workloadProcessPattern}'`,
   "| grep -Ev 'client_start\\.py|server_start\\.py|fake_cmd|/nvitop|/gpustat|torch/_inductor/compile_worker'",
   "| while read -r user pid ppid pgid sid elapsed cmd; do",
   "nspids=$(awk '/^NSpid:/{for(i=2;i<=NF;i++) printf \"%s%s\", (i==2?\"\":\",\"), $i}' /proc/\"$pid\"/status 2>/dev/null);",
@@ -90,7 +91,7 @@ function buildContainerCwdQuery(users) {
   "done);",
   "if test \"$deep_inspection_needed\" = 1; then",
   "docker ps -q --no-trunc 2>/dev/null | grep -E '^[0-9a-f]{12,64}$' | head -n 32 | while IFS= read -r container_id; do",
-  "docker exec -u 0 \"$container_id\" sh -c 'container_id=$1; ps -ww -e -o pid= -o args= 2>/dev/null | grep -E \"[t]orchrun|[d]eepspeed|[a]ccelerate|[p]ython|[s]wift\" | grep -Ev \"client_start\\.py|server_start\\.py|fake_cmd|/nvitop|/gpustat|torch/_inductor/compile_worker\" | head -n 128 | while read -r pid cmd; do printf \"%s\" \"$pid\" | grep -Eq \"^[0-9]+$\" || continue; cwd=$(readlink /proc/\"$pid\"/cwd 2>/dev/null || true); test -n \"$cwd\" || continue; cmd=$(printf \"%s\" \"$cmd\" | cut -c1-700); printf \"%s\\\\t%s\\\\t%s\\\\t%s\\\\n\" \"$container_id\" \"$pid\" \"$cwd\" \"$cmd\"; done' sh \"$container_id\" 2>/dev/null || true;",
+  `docker exec -u 0 "$container_id" sh -c 'container_id=$1; ps -ww -e -o pid= -o args= 2>/dev/null | grep -E "${workloadProcessPattern}" | grep -Ev "client_start\\.py|server_start\\.py|fake_cmd|/nvitop|/gpustat|torch/_inductor/compile_worker" | head -n 128 | while read -r pid cmd; do printf "%s" "$pid" | grep -Eq "^[0-9]+$" || continue; cwd=$(readlink /proc/"$pid"/cwd 2>/dev/null || true); test -n "$cwd" || continue; cmd=$(printf "%s" "$cmd" | cut -c1-700); printf "%s\\\\t%s\\\\t%s\\\\t%s\\\\n" "$container_id" "$pid" "$cwd" "$cmd"; done' sh "$container_id" 2>/dev/null || true;`,
   "done;",
   "fi;",
   "fi",
@@ -110,8 +111,8 @@ const deviceQuery = [
   "for pid in $unique_pids; do",
   "nspids=$(awk '/^NSpid:/{for(i=2;i<=NF;i++) printf \"%s%s\", (i==2?\"\":\",\"), $i}' /proc/\"$pid\"/status 2>/dev/null);",
   "cwd=$(readlink /proc/\"$pid\"/cwd 2>/dev/null || true);",
-  "ps -ww -p \"$pid\" -o user= -o etime= -o args= 2>/dev/null",
-  "| awk -v pid=\"$pid\" -v nspids=\"$nspids\" -v cwd=\"$cwd\" '{user=$1; elapsed=$2; sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]*/, \"\"); cmd=substr($0,1,700); printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", pid, user, elapsed, nspids, cwd, cmd}';",
+  "ps -ww -p \"$pid\" -o user= -o ppid= -o pgid= -o sid= -o etime= -o args= 2>/dev/null",
+  "| awk -v pid=\"$pid\" -v nspids=\"$nspids\" -v cwd=\"$cwd\" '{user=$1; ppid=$2; pgid=$3; sid=$4; elapsed=$5; for(i=1;i<=5;i++) sub(/^[[:space:]]*[^[:space:]]+[[:space:]]*/, \"\"); cmd=substr($0,1,700); printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", pid, user, ppid, pgid, sid, elapsed, nspids, cwd, cmd}';",
   "done",
 ].join(" ");
 const remoteProbePrefix = `printf '__WATCH4GPU_HOST__\\n'; hostname; printf '__WATCH4GPU_GPUS__\\n'; ${gpuQuery}; printf '__WATCH4GPU_PROCESSES__\\n'; ${processQuery}; printf '__WATCH4GPU_OWNERS__\\n'; ${ownerQuery}; printf '__WATCH4GPU_WORKLOADS__\\n'; ${workloadQuery}; printf '__WATCH4GPU_NAMESPACES__\\n'; ${namespaceQuery}; printf '__WATCH4GPU_DEVICES__\\n'; ${deviceQuery}; printf '${containerCwdMarker}\\n'`;
@@ -394,10 +395,14 @@ function addCandidate(map, key, value) {
   map.set(key, current);
 }
 
-function selectUnambiguousWorkload(candidates) {
+function selectUnambiguousWorkload(candidates, { requireTaskEvidence = false } = {}) {
   if (!candidates?.length) return null;
-  const usable = candidates.filter((candidate) => candidate.attributedUser);
-  if (usable.length !== candidates.length) return null;
+  const relevant = requireTaskEvidence
+    ? candidates.filter((candidate) => candidate.attributionEvidence?.taskUser)
+    : candidates;
+  if (!relevant.length) return null;
+  const usable = relevant.filter((candidate) => candidate.attributedUser);
+  if (usable.length !== relevant.length) return null;
   const users = new Set(usable.map((candidate) => candidate.attributedUser));
   if (users.size !== 1) return null;
   return usable.find((candidate) => candidate.command) || usable[0];
@@ -469,6 +474,8 @@ function parseProbe(output) {
   }
   const workloadsByExactPid = new Map();
   const namespaceCandidates = new Map();
+  const pgidCandidates = new Map();
+  const sidCandidates = new Map();
   const cudaCandidates = new Map();
   const deviceCandidates = new Map();
   const workloads = [];
@@ -485,9 +492,11 @@ function parseProbe(output) {
     const worldSize = integerOrNull(worldSizeValue === "-" ? "" : worldSizeValue);
     const physicalGpu = visibleDevices.length === 1
       ? visibleDevices[0]
-      : localRank != null && localRank < visibleDevices.length
+      : localRank != null && visibleDevices.length > 0 && localRank < visibleDevices.length
         ? visibleDevices[localRank]
-        : null;
+        : localRank != null && visibleDevices.length === 0
+          ? localRank
+          : null;
     const workload = {
       user,
       pid: Number(pid),
@@ -519,7 +528,7 @@ function parseProbe(output) {
     for (const namespacePid of namespacePids) {
       if (namespacePid !== workload.pid) addCandidate(namespaceCandidates, namespacePid, workload);
     }
-    if (physicalGpu != null) addCandidate(cudaCandidates, physicalGpu, workload);
+    for (const device of workload.devices) addCandidate(cudaCandidates, device, workload);
   }
   for (const workload of workloads) {
     if (workload.attributionEvidence.taskUser) continue;
@@ -538,6 +547,10 @@ function parseProbe(output) {
       }
       parent = workloadsByExactPid.get(parent.ppid);
     }
+  }
+  for (const workload of workloads) {
+    addCandidate(pgidCandidates, workload.pgid, workload);
+    addCandidate(sidCandidates, workload.sid, workload);
   }
   for (const line of namespacePart.split(/\r?\n/)) {
     const [user, pid, ppid, pgid, sid, elapsed, namespacePidsValue, cwd, ...commandParts] = line.split("\t");
@@ -564,10 +577,12 @@ function parseProbe(output) {
     for (const namespacePid of namespacePids) {
       if (namespacePid !== evidence.pid) addCandidate(namespaceCandidates, namespacePid, evidence);
     }
+    addCandidate(pgidCandidates, evidence.pgid, evidence);
+    addCandidate(sidCandidates, evidence.sid, evidence);
   }
   const deviceProcesses = new Map();
   for (const line of deviceProcessPart.split(/\r?\n/)) {
-    const [pid, user, elapsed, namespacePidsValue, cwd, ...commandParts] = line.split("\t");
+    const [pid, user, ppid, pgid, sid, elapsed, namespacePidsValue, cwd, ...commandParts] = line.split("\t");
     if (!/^\d+$/.test(pid || "") || !user) continue;
     const namespacePids = parseNamespacePids(namespacePidsValue);
     const hostPid = namespacePids[0] || Number(pid);
@@ -577,9 +592,9 @@ function parseProbe(output) {
     deviceProcesses.set(Number(pid), {
       user,
       pid: Number(pid),
-      ppid: null,
-      pgid: null,
-      sid: null,
+      ppid: integerOrNull(ppid),
+      pgid: integerOrNull(pgid),
+      sid: integerOrNull(sid),
       elapsed,
       namespacePids,
       hostPid,
@@ -596,12 +611,16 @@ function parseProbe(output) {
     if (!process) continue;
     addCandidate(deviceCandidates, Number(gpuIndex), { ...process, deviceMethod: method });
   }
-  const inferredWorkloadUsers = new Set(
-    workloads
-      .map((workload) => workload.attributionEvidence.taskUser)
-      .filter(Boolean),
-  );
-  const soleInferredUser = inferredWorkloadUsers.size === 1 ? [...inferredWorkloadUsers][0] : null;
+  const findTaskAncestor = (startPid) => {
+    let current = workloadsByExactPid.get(startPid);
+    const visited = new Set();
+    while (current && !visited.has(current.pid)) {
+      visited.add(current.pid);
+      if (current.attributionEvidence?.taskUser) return current;
+      current = workloadsByExactPid.get(current.ppid);
+    }
+    return null;
+  };
   const gpuRows = gpuPart.split(/\r?\n/).filter((line) => /^\s*\d+\s*,/.test(line)).map((line) => {
     const [index, name, uuid, temperature, utilization, memoryUsed, memoryTotal, powerDraw, powerLimit] = csv(line);
     return {
@@ -621,23 +640,38 @@ function parseProbe(output) {
     const directOwner = owners.get(numericPid);
     const directDeviceProcess = deviceProcesses.get(numericPid);
     const directWorkload = workloadsByExactPid.get(numericPid);
-    const namespaceWorkload = selectUnambiguousWorkload(namespaceCandidates.get(numericPid));
-    const deviceWorkload = selectUnambiguousWorkload(deviceCandidates.get(gpuIndex));
-    const cudaWorkload = selectUnambiguousWorkload(cudaCandidates.get(gpuIndex));
+    const directTaskWorkload = directWorkload?.attributionEvidence?.taskUser ? directWorkload : null;
+    const directTaskOwner = directOwner?.attributionEvidence?.taskUser ? directOwner : null;
+    const namespaceWorkload = selectUnambiguousWorkload(namespaceCandidates.get(numericPid), { requireTaskEvidence: true });
+    const ancestorWorkload = findTaskAncestor(directDeviceProcess?.ppid);
+    const pgidWorkload = selectUnambiguousWorkload(pgidCandidates.get(directDeviceProcess?.pgid), { requireTaskEvidence: true });
+    const deviceWorkload = selectUnambiguousWorkload(deviceCandidates.get(gpuIndex), { requireTaskEvidence: true });
+    const cudaWorkload = selectUnambiguousWorkload(cudaCandidates.get(gpuIndex), { requireTaskEvidence: true });
+    const sidWorkload = selectUnambiguousWorkload(sidCandidates.get(directDeviceProcess?.sid), { requireTaskEvidence: true });
+    const weakDeviceWorkload = selectUnambiguousWorkload(deviceCandidates.get(gpuIndex));
+    const weakCudaWorkload = selectUnambiguousWorkload(cudaCandidates.get(gpuIndex));
     let workload = null;
     let owner = null;
     let mappingSource = null;
-    if (directWorkload) {
-      workload = directWorkload;
-      owner = directWorkload;
+    if (directTaskWorkload) {
+      workload = directTaskWorkload;
+      owner = directTaskWorkload;
       mappingSource = "pid";
-    } else if (directOwner) {
-      owner = directOwner;
+    } else if (directTaskOwner) {
+      owner = directTaskOwner;
       mappingSource = "pid";
     } else if (namespaceWorkload) {
       workload = namespaceWorkload;
       owner = namespaceWorkload;
       mappingSource = "nspid";
+    } else if (ancestorWorkload) {
+      workload = ancestorWorkload;
+      owner = ancestorWorkload;
+      mappingSource = "parent";
+    } else if (pgidWorkload) {
+      workload = pgidWorkload;
+      owner = pgidWorkload;
+      mappingSource = "parent";
     } else if (deviceWorkload) {
       workload = deviceWorkload;
       owner = deviceWorkload;
@@ -646,6 +680,25 @@ function parseProbe(output) {
       workload = cudaWorkload;
       owner = cudaWorkload;
       mappingSource = "cuda-env";
+    } else if (sidWorkload) {
+      workload = sidWorkload;
+      owner = sidWorkload;
+      mappingSource = "parent";
+    } else if (directWorkload) {
+      workload = directWorkload;
+      owner = directWorkload;
+      mappingSource = "pid";
+    } else if (weakDeviceWorkload) {
+      workload = weakDeviceWorkload;
+      owner = weakDeviceWorkload;
+      mappingSource = "device";
+    } else if (weakCudaWorkload) {
+      workload = weakCudaWorkload;
+      owner = weakCudaWorkload;
+      mappingSource = "cuda-env";
+    } else if (directOwner) {
+      owner = directOwner;
+      mappingSource = "pid";
     }
     const launchCommand = workload?.command || directDeviceProcess?.command || owner?.command || null;
     const linkedAttribution = workload?.attributionEvidence || owner?.attributionEvidence
@@ -659,20 +712,8 @@ function parseProbe(output) {
           command: launchCommand,
           cwd: directDeviceProcess?.cwd || owner?.cwd || null,
         });
-    const fallbackAttribution = !mappingSource && !linkedAttribution.attributedUser && soleInferredUser
-      ? {
-          attributedUser: soleInferredUser,
-          attributionEvidence: {
-            systemAccount: null,
-            environmentUser: null,
-            taskUser: soleInferredUser,
-            taskSources: ["node"],
-            conflict: false,
-          },
-        }
-      : linkedAttribution;
-    const attributedUser = fallbackAttribution.attributedUser;
-    const attributionSource = mappingSource || (fallbackAttribution.attributionEvidence?.taskSources.includes("node") ? "node" : attributedUser ? "path" : null);
+    const attributedUser = linkedAttribution.attributedUser;
+    const attributionSource = mappingSource || (attributedUser ? "path" : null);
     return {
       gpuUuid,
       pid: numericPid,
@@ -681,7 +722,7 @@ function parseProbe(output) {
       owner: owner?.user || null,
       attributedUser,
       attributionSource,
-      attributionEvidence: fallbackAttribution.attributionEvidence || null,
+      attributionEvidence: linkedAttribution.attributionEvidence || null,
       elapsed: owner?.elapsed || null,
       command: launchCommand,
       containerPid: workload?.pid || null,
