@@ -651,9 +651,17 @@ export default function Home() {
 
       {serviceError && nodes.length > 0 && <div className="notice" role="alert"><span aria-hidden="true">!</span><div><strong>暂时无法刷新</strong><p>继续显示上次成功采集的数据。</p></div><button onClick={() => { void loadNodes(); void refresh(); }}>重试</button></div>}
 
-      <section className="section-head">
-        <div><h2>{query ? `${filteredNodes.length} 个匹配节点` : `${nodes.length} 个计算节点`}</h2><p>{query ? `搜索“${query}”` : "空闲资源优先显示"}</p></div>
-        <span>{freeGpuTotal ? `${freeGpuTotal} 块 GPU 可立即使用` : allGpus.length ? "当前没有空闲 GPU" : "等待资源数据"}</span>
+      <section className="section-head" aria-labelledby="nodes-heading">
+        <div className="section-heading">
+          <div>
+            <h2 id="nodes-heading">{query ? `${filteredNodes.length} 个匹配节点` : `${nodes.length} 个计算节点`}</h2>
+            <p>{query ? `搜索“${query}”` : "按可用资源排序，空闲节点优先"}</p>
+          </div>
+        </div>
+        <div className={`availability-status ${freeGpuTotal ? "available" : allGpus.length ? "busy" : "pending"}`}>
+          <span className="availability-dot" aria-hidden="true" />
+          <span>{freeGpuTotal ? `${freeGpuTotal} 块 GPU 可立即使用` : allGpus.length ? "暂无空闲 GPU" : "等待资源数据"}</span>
+        </div>
       </section>
 
       <section className="node-grid" aria-label="计算节点">
