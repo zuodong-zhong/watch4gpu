@@ -1,9 +1,12 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { userInfo } from "node:os";
 import { readFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createNodeCollector } from "./node-collector.mjs";
+import { buildRelayCommandLogin, buildRelayCommandProbe, relayCommandReadyMarker } from "./lib/relay-command.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_FILE = join(ROOT, "data", "nodes.json");
@@ -21,12 +24,30 @@ const configuredOrigins = new Set(
     .map((origin) => origin.trim())
     .filter(Boolean),
 );
-const configuredUserPathPrefixes = (process.env.WATCH4GPU_USER_PATH_PREFIXES || "")
-  .split(",")
+const localUserPathPrefixes = (() => {
+  try {
+    const value = JSON.parse(readFileSync(join(ROOT, "data", "user-path-prefixes.local.json"), "utf8"));
+    return Array.isArray(value?.prefixes) ? value.prefixes : [];
+  } catch (error) {
+    if (error?.code !== "ENOENT") console.warn("忽略无效的本地用户目录配置");
+    return [];
+  }
+})();
+const configuredUserPathPrefixes = [
+  ...localUserPathPrefixes,
+  ...(process.env.WATCH4GPU_USER_PATH_PREFIXES || "").split(","),
+]
+  .filter((prefix) => typeof prefix === "string")
   .map((prefix) => prefix.trim().replace(/\/+$/, ""))
-  .filter(Boolean);
+  .filter((prefix) => /^\/[A-Za-z0-9_./-]+$/.test(prefix));
+const userPathPrefixes = [...new Set([
+  ...configuredUserPathPrefixes, "/public", "/home", "/Users", "/shared/users", "/data/users", "/mnt/users",
+])].sort((left, right) => right.length - left.length);
+const userPathPattern = `(${userPathPrefixes.map((prefix) => prefix.replaceAll(".", "\\.")).join("|")})/`;
+
 const idPattern = /^[A-Za-z0-9._-]+$/;
 const nodeNumberPattern = /^\d+$/;
+const safeRemoteArg = /^[A-Za-z0-9._-]+$/;
 const safeRemotePath = /^[A-Za-z0-9_./~+-]+$/;
 const localDeepInspectionUsers = (() => {
   try {
@@ -65,6 +86,14 @@ const workloadQuery = [
   "| awk -F '\\t' '{key=$1 SUBSEP $9 SUBSEP $10 SUBSEP $11 SUBSEP $12 SUBSEP $13; gsub(/--(local_rank|node_rank|parent|read-fd|write-fd)(=| )[0-9]+/, \"--dynamic=*\", key); if (!seen[key]++) print}'",
   "| head -n 64",
 ].join(" ");
+const mountInfoMarker = "__WATCH4GPU_MOUNTS__";
+const mountInfoQuery = [
+  "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u",
+  "| while IFS= read -r pid; do",
+  "printf '%s' \"$pid\" | grep -Eq '^[0-9]+$' || continue;",
+  `awk -v pid="$pid" '{separator=0; for(i=6;i<=NF;i++) if($i=="-"){separator=i; break} if(!separator) next; root=$4; point=$5; mount_source=$(separator+2); combined=root " " point " " mount_source; if(combined ~ /${userPathPattern.replaceAll("/", "\\/")}/) printf "%s\\t%s\\t%s\\t%s\\n", pid, point, root, mount_source}' /proc/"$pid"/mountinfo 2>/dev/null;`,
+  "done | head -n 512",
+].join(" ");
 const namespaceQuery = [
   "ps -ww -e -o user= -o pid= -o ppid= -o pgid= -o sid= -o etime= -o args=",
   `| grep -E '${workloadProcessPattern}'`,
@@ -87,7 +116,7 @@ function buildContainerCwdQuery(users) {
   "process_line=$(ps -ww -p \"$pid\" -o user= -o args= 2>/dev/null);",
   "process_user=$(printf '%s' \"$process_line\" | awk '{print $1}');",
   `if printf '%s' "$process_user" | grep -Eq '^(${accountPattern})$'; then printf '1'; break; fi;`,
-  `if printf '%s' "$process_line" | grep -Eq '/(public|9950backfile|home|Users)/(${accountPattern})/'; then printf '1'; break; fi;`,
+  `if printf '%s' "$process_line" | grep -Eq '${userPathPattern}(${accountPattern})/'; then printf '1'; break; fi;`,
   "done);",
   "if test \"$deep_inspection_needed\" = 1; then",
   "docker ps -q --no-trunc 2>/dev/null | grep -E '^[0-9a-f]{12,64}$' | head -n 32 | while IFS= read -r container_id; do",
@@ -115,9 +144,26 @@ const deviceQuery = [
   "| awk -v pid=\"$pid\" -v nspids=\"$nspids\" -v cwd=\"$cwd\" '{user=$1; ppid=$2; pgid=$3; sid=$4; elapsed=$5; for(i=1;i<=5;i++) sub(/^[[:space:]]*[^[:space:]]+[[:space:]]*/, \"\"); cmd=substr($0,1,700); printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", pid, user, ppid, pgid, sid, elapsed, nspids, cwd, cmd}';",
   "done",
 ].join(" ");
-const remoteProbePrefix = `printf '__WATCH4GPU_HOST__\\n'; hostname; printf '__WATCH4GPU_GPUS__\\n'; ${gpuQuery}; printf '__WATCH4GPU_PROCESSES__\\n'; ${processQuery}; printf '__WATCH4GPU_OWNERS__\\n'; ${ownerQuery}; printf '__WATCH4GPU_WORKLOADS__\\n'; ${workloadQuery}; printf '__WATCH4GPU_NAMESPACES__\\n'; ${namespaceQuery}; printf '__WATCH4GPU_DEVICES__\\n'; ${deviceQuery}; printf '${containerCwdMarker}\\n'`;
+const remoteProbePrefix = `printf '__WATCH4GPU_HOST__\\n'; hostname; printf '__WATCH4GPU_GPUS__\\n'; ${gpuQuery}; printf '__WATCH4GPU_PROCESSES__\\n'; ${processQuery}; printf '__WATCH4GPU_OWNERS__\\n'; ${ownerQuery}; printf '__WATCH4GPU_WORKLOADS__\\n'; ${workloadQuery}; printf '${mountInfoMarker}\\n'; ${mountInfoQuery}; printf '__WATCH4GPU_NAMESPACES__\\n'; ${namespaceQuery}; printf '__WATCH4GPU_DEVICES__\\n'; ${deviceQuery}; printf '${containerCwdMarker}\\n'`;
 const remoteProbe = `${remoteProbePrefix}; ${CONTAINER_PROCESS_INSPECTION ? containerCwdQuery : ":"}; printf '__WATCH4GPU_DONE__\\n'`;
-const relayRemoteProbe = `${remoteProbePrefix}; :; printf '__WATCH4GPU_DONE__\\n'`;
+function relayMarkerPrint(marker) {
+  const prefix = "__WATCH4GPU_";
+  if (!marker.startsWith(prefix)) throw new Error(`无效的中转标记：${marker}`);
+  return `printf '%s%s\\n' '${prefix}' '${marker.slice(prefix.length)}'`;
+}
+const relayRemoteProbeSteps = [
+  { marker: "__WATCH4GPU_GPUS__", stage: "读取节点名称", command: `${relayMarkerPrint("__WATCH4GPU_HOST__")}; hostname; ${relayMarkerPrint("__WATCH4GPU_GPUS__")}` },
+  { marker: "__WATCH4GPU_PROCESSES__", stage: "读取 GPU 状态", command: `${gpuQuery}; ${relayMarkerPrint("__WATCH4GPU_PROCESSES__")}` },
+  { marker: "__WATCH4GPU_OWNERS__", stage: "读取 GPU 进程", command: `${processQuery}; ${relayMarkerPrint("__WATCH4GPU_OWNERS__")}` },
+  { marker: "__WATCH4GPU_WORKLOADS__", stage: "读取进程归属", command: `${ownerQuery}; ${relayMarkerPrint("__WATCH4GPU_WORKLOADS__")}` },
+  { marker: mountInfoMarker, stage: "读取训练进程", command: `${workloadQuery}; ${relayMarkerPrint(mountInfoMarker)}` },
+  { marker: "__WATCH4GPU_NAMESPACES__", stage: "读取进程挂载信息", command: `${mountInfoQuery}; ${relayMarkerPrint("__WATCH4GPU_NAMESPACES__")}` },
+  { marker: "__WATCH4GPU_DEVICES__", stage: "读取进程命名空间", command: `${namespaceQuery}; ${relayMarkerPrint("__WATCH4GPU_DEVICES__")}` },
+  { marker: containerCwdMarker, stage: "读取 GPU 设备占用", command: `${deviceQuery}; ${relayMarkerPrint(containerCwdMarker)}` },
+  { marker: "__WATCH4GPU_DONE__", stage: "完成采集", command: `:; ${relayMarkerPrint("__WATCH4GPU_DONE__")}` },
+];
+const relayRemoteProbe = relayRemoteProbeSteps.map(({ command }) => command).join("\r");
+const relayCommandProbe = buildRelayCommandProbe(relayRemoteProbeSteps);
 
 function json(response, status, value) {
   response.writeHead(status, {
@@ -161,9 +207,11 @@ function validateNodes(value) {
     if (!['direct', 'relay'].includes(node.mode)) throw new Error(`${node.id} 的连接方式无效`);
     if (node.mode === "direct" && !idPattern.test(node.sshHost || "")) throw new Error(`${node.id} 的 SSH Host 别名无效`);
     if (node.mode === "relay") {
+      if (node.relayTransport != null && !["shell", "command"].includes(node.relayTransport)) throw new Error(`${node.id} 的采集通道无效`);
       if (!idPattern.test(node.gatewayHost || "")) throw new Error(`${node.id} 的网关 Host 无效`);
       if (!nodeNumberPattern.test(node.gpuNodeId || "")) throw new Error(`${node.id} 的 GPU 节点编号必须为数字`);
       if (!safeRemotePath.test(node.loginScript || "")) throw new Error(`${node.id} 的登录脚本路径无效`);
+      if (node.loginArg != null && node.loginArg !== "" && !safeRemoteArg.test(node.loginArg)) throw new Error(`${node.id} 的登录脚本参数无效`);
     }
     node.name = node.name.trim().slice(0, 80);
     node.enabled = node.enabled !== false;
@@ -182,38 +230,48 @@ function parseTimeoutMs(value) {
   return seconds * 1000;
 }
 
-function run(command, args, input, timeoutMs = SSH_TIMEOUT_MS) {
+function run(command, args, input, timeoutMs = SSH_TIMEOUT_MS, spawnProcess = spawn) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: [input ? "pipe" : "ignore", "pipe", "pipe"] });
+    const child = spawnProcess(command, args, { stdio: [input ? "pipe" : "ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
+    let failure = null;
+    let killTimer;
+    const terminate = () => {
+      if (killTimer || child.exitCode != null || child.signalCode != null) return;
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+      killTimer.unref();
       child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 1000).unref();
-      settled = true;
-      reject(new Error(`连接超时（${Math.round(timeoutMs / 1000)} 秒）`));
+    };
+    const timer = setTimeout(() => {
+      failure ??= new Error(`连接超时（${Math.round(timeoutMs / 1000)} 秒）`);
+      terminate();
     }, timeoutMs);
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
+      failure ??= error;
       clearTimeout(timer);
-      reject(error);
+      if (child.pid != null) terminate();
     });
     child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
       clearTimeout(timer);
-      if (code === 0 && stdout.includes("__WATCH4GPU_DONE__")) resolve(stdout);
+      clearTimeout(killTimer);
+      // Keep the collection locked until SSH has exited and closed its pipes.
+      if (failure) reject(failure);
+      else if (code === 0 && stdout.includes("__WATCH4GPU_DONE__")) resolve(stdout);
       else {
         const details = `${stdout}\n${stderr}`.trim() || `SSH 退出码 ${code}`;
         reject(new Error(details.slice(-1800)));
       }
     });
-    if (input) child.stdin.end(input);
+    if (input) {
+      child.stdin.on("error", (error) => {
+        failure ??= error;
+        terminate();
+      });
+      child.stdin.end(input);
+    }
   });
 }
 
@@ -224,37 +282,118 @@ function stripTerminalCodes(value) {
     .replace(/\r/g, "");
 }
 
-function runRelay(node, timeoutMs = RELAY_TIMEOUT_MS) {
+function relayShellReady(output, loginScript) {
+  const clean = stripTerminalCodes(output);
+  if (/conda activate[^\n]*\n[^\n]*root@[^#]*#/.test(clean)) return true;
+  if (/(?:^|\/)login_new(?:_expect)?\.sh$/.test(loginScript || "")) {
+    const pexpectAt = clean.lastIndexOf("pexpect --kill_disabled -- /bin/bash");
+    return pexpectAt >= 0 && /root@[^#\n]*#\s*$/.test(clean.slice(pexpectAt));
+  }
+  if (!/(?:^|\/)login_1\.sh$/.test(loginScript || "")) return false;
+  // login_1.sh intentionally stops after handing control to pexpect/bash and
+  // does not activate conda.  Wait for the prompt emitted after that handoff,
+  // rather than requiring a particular cd echo (which varies by TTY/client).
+  const pexpectAt = clean.lastIndexOf("pexpect --");
+  if (pexpectAt >= 0 && /root@[^#\n]*#\s*$/.test(clean.slice(pexpectAt))) return true;
+  const lines = clean.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.slice(-6).some((line) => /^root@[^#]*#\s+cd\s+\/\S+\s*$/.test(line))) return true;
+  const lastLine = lines.at(-1) || "";
+  if (!/^root@[^#]*#$/.test(lastLine)) return false;
+  return lines.slice(-4, -1).some((line) => /(?:^|#\s*)cd\s+\/\S+\s*$/.test(line));
+}
+
+function relayLoginStage(output) {
+  const clean = stripTerminalCodes(output);
+  if (/conda activate/.test(clean)) return "等待 Conda 初始化";
+  if (/pexpect\s+[^\n]*\/bin\/bash/.test(clean)) return "等待节点 Shell";
+  if (/\[fake_cmd[^\]]*\]\$/.test(clean)) return "等待交互终端启动";
+  return clean.trim() ? "等待中转服务握手" : "连接 SSH 网关";
+}
+
+function runRelay(node, timeoutMs = RELAY_TIMEOUT_MS, spawnProcess = spawn) {
   return new Promise((resolve, reject) => {
-    const args = ["-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", node.gatewayHost, `bash ${node.loginScript} ${node.gpuNodeId}`];
-    const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const loginArg = node.loginArg || node.gpuNodeId;
+    const commandMode = node.relayTransport === "command";
+    const loginCommand = commandMode ? buildRelayCommandLogin(node) : `bash ${node.loginScript} ${loginArg}`;
+    const args = ["-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", node.gatewayHost, loginCommand];
+    const child = spawnProcess("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let sentProbe = false;
-    let settled = false;
+    let sentPexpect = false;
+    let relayStepIndex = 0;
+    let outcome = null;
+    let killTimer;
+    const markerCount = (marker) => stdout.split(marker).length - 1;
+    const sendRelayStep = () => child.stdin.write(`${relayRemoteProbeSteps[relayStepIndex].command}\r`);
     const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
+      if (outcome) return;
+      outcome = { error, value };
       clearTimeout(timer);
-      child.kill("SIGTERM");
-      if (error) reject(error); else resolve(value);
-    };
-    const timer = setTimeout(() => finish(new Error(`中转连接超时（${Math.round(timeoutMs / 1000)} 秒）`)), timeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-      const clean = stripTerminalCodes(stdout);
-      if (!sentProbe && /conda activate[^\n]*\n[^\n]*root@[^#]*#/.test(clean)) {
-        sentProbe = true;
-        child.stdin.write(`${relayRemoteProbe}\r`);
+      if (child.pid != null && child.exitCode == null && child.signalCode == null) {
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+        killTimer.unref();
+        child.kill("SIGTERM");
       }
-      if ((stdout.match(/__WATCH4GPU_DONE__/g) || []).length >= 2) finish(null, stripTerminalCodes(stdout));
+    };
+    const failForStartupError = () => {
+      if (outcome || sentProbe) return false;
+      const clean = stripTerminalCodes(`${stdout}\n${stderr}`);
+      if (!/Command terminated with exception:\s*<class ['"]ValueError['"]>\s*-\s*filedescriptor out of range in select\(\)/.test(clean)) return false;
+      finish(new Error("中转交互终端启动失败：服务器 select() 文件描述符超出限制，无法创建节点 Shell"));
+      return true;
+    };
+    const timer = setTimeout(() => {
+      const stage = sentProbe ? relayRemoteProbeSteps[relayStepIndex].stage : relayLoginStage(stdout);
+      finish(new Error(`中转连接超时（${Math.round(timeoutMs / 1000)} 秒）：${stage}`));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      if (outcome) return;
+      stdout += chunk;
+      if (failForStartupError()) return;
+      if (commandMode) {
+        if (!sentProbe && stdout.includes(relayCommandReadyMarker)) {
+          sentProbe = true;
+          child.stdin.write(`${relayCommandProbe}\r`);
+        }
+        if (sentProbe) {
+          // The batch emits the same section markers as interactive collection.
+          while (relayStepIndex < relayRemoteProbeSteps.length && markerCount(relayRemoteProbeSteps[relayStepIndex].marker)) relayStepIndex += 1;
+          if (relayStepIndex === relayRemoteProbeSteps.length) finish(null, stripTerminalCodes(stdout));
+        }
+        return;
+      }
+      if (!sentPexpect && /\[fake_cmd[^\]]*\]\$\s*$/.test(stripTerminalCodes(stdout)) && /(?:^|\/)login_new\.sh$/.test(node.loginScript || "")) {
+        sentPexpect = true;
+        child.stdin.write("pexpect --kill_disabled -- /bin/bash\r");
+      }
+      if (!sentProbe && relayShellReady(stdout, node.loginScript)) {
+        sentProbe = true;
+        sendRelayStep();
+      }
+      if (sentProbe && markerCount(relayRemoteProbeSteps[relayStepIndex].marker) >= 1) {
+        if (relayStepIndex === relayRemoteProbeSteps.length - 1) finish(null, stripTerminalCodes(stdout));
+        else {
+          relayStepIndex += 1;
+          sendRelayStep();
+        }
+      }
     });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stderr.on("data", (chunk) => {
+      if (outcome) return;
+      stderr += chunk;
+      failForStartupError();
+    });
+    child.stdin.on("error", (error) => finish(error));
     child.on("error", (error) => finish(error));
     child.on("close", (code) => {
-      if (settled) return;
-      const details = stripTerminalCodes(`${stdout}\n${stderr}`).trim() || `SSH 退出码 ${code}`;
-      finish(new Error(details.slice(-1800)));
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      if (!outcome) {
+        const details = stripTerminalCodes(`${stdout}\n${stderr}`).trim() || `SSH 退出码 ${code}`;
+        outcome = { error: new Error(details.slice(-1800)) };
+      }
+      if (outcome.error) reject(outcome.error); else resolve(outcome.value);
     });
   });
 }
@@ -269,8 +408,9 @@ function number(value) {
 }
 
 const ignoredPathUsers = new Set([
-  ".venv", ".vscode-server", "9950backfile", "bin", "conda", "data", "datasets", "env", "envs", "home", "mnt", "opt", "public",
+  ".venv", ".vscode-server", "bin", "conda", "data", "datasets", "env", "envs", "home", "mnt", "opt", "public",
   "root", "share", "shared", "software", "softwares", "tmp", "users", "usr", "var", "venv", "work", "workspace",
+  ...configuredUserPathPrefixes.map((prefix) => prefix.split("/").at(-1).toLowerCase()),
 ]);
 const configOptions = new Set(["--cfg", "--config", "--config-file", "--config_path", "--config-path"]);
 const outputOptions = new Set([
@@ -295,7 +435,7 @@ function usablePathUser(value) {
 function inferUserFromPath(value) {
   if (!value || value === "-" || value === "[Not Found]") return null;
   const cleanValue = value.replace(/^['"]|['"]$/g, "");
-  for (const prefix of configuredUserPathPrefixes) {
+  for (const prefix of userPathPrefixes) {
     const marker = `${prefix}/`;
     const start = cleanValue.indexOf(marker);
     if (start < 0) continue;
@@ -303,7 +443,6 @@ function inferUserFromPath(value) {
     if (candidate) return candidate;
   }
   const patterns = [
-    /\/9950backfile\/([^/\s]+)/i,
     /\/public\/([^/\s]+)/i,
     /\/(?:home|Users)\/([^/\s]+)/,
     /\/(?:data|mnt)\/(?:home|users?)\/([^/\s]+)/i,
@@ -329,16 +468,17 @@ function addTaskEvidence(evidence, source, value) {
 function chooseTaskUser(taskEvidence) {
   if (!taskEvidence.length) return null;
   const scores = new Map();
-  const weights = { output: 4, config: 4, script: 3, cwd: 3, parent: 2 };
+  const weights = { mount: 5, output: 4, config: 4, script: 3, cwd: 3, parent: 2 };
   for (const item of taskEvidence) scores.set(item.user, (scores.get(item.user) || 0) + (weights[item.source] || 1));
   return [...scores.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0][0];
 }
 
-function buildAttribution({ systemAccount = null, processName = null, command = null, cwd = null, inheritedTaskUser = null }) {
+function buildAttribution({ systemAccount = null, processName = null, command = null, cwd = null, mountUser = null, inheritedTaskUser = null }) {
   const tokens = commandTokens(command);
   const environmentUser = inferUserFromPath(processName) || inferUserFromPath(tokens[0]);
   const taskEvidence = [];
   addTaskEvidence(taskEvidence, "cwd", cwd);
+  if (mountUser) taskEvidence.push({ source: "mount", user: mountUser });
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     const separator = token.indexOf("=");
@@ -414,6 +554,7 @@ function parseProbe(output) {
   const processMarker = "__WATCH4GPU_PROCESSES__";
   const ownerMarker = "__WATCH4GPU_OWNERS__";
   const workloadMarker = "__WATCH4GPU_WORKLOADS__";
+  const mountMarker = "__WATCH4GPU_MOUNTS__";
   const namespaceMarker = "__WATCH4GPU_NAMESPACES__";
   const deviceMarker = "__WATCH4GPU_DEVICES__";
   const containerMarker = "__WATCH4GPU_CONTAINER_CWDS__";
@@ -423,6 +564,7 @@ function parseProbe(output) {
   const processStart = output.lastIndexOf(processMarker);
   const ownerStart = output.lastIndexOf(ownerMarker);
   const workloadStart = output.lastIndexOf(workloadMarker);
+  const mountStart = output.lastIndexOf(mountMarker);
   const namespaceStart = output.lastIndexOf(namespaceMarker);
   const deviceStart = output.lastIndexOf(deviceMarker);
   const containerStart = output.lastIndexOf(containerMarker);
@@ -431,7 +573,9 @@ function parseProbe(output) {
   const gpuPart = gpuStart >= 0 && processStart > gpuStart ? output.slice(gpuStart + gpuMarker.length, processStart) : "";
   const processPart = processStart >= 0 && ownerStart > processStart ? output.slice(processStart + processMarker.length, ownerStart) : "";
   const ownerPart = ownerStart >= 0 && workloadStart > ownerStart ? output.slice(ownerStart + ownerMarker.length, workloadStart) : "";
-  const workloadPart = workloadStart >= 0 && namespaceStart > workloadStart ? output.slice(workloadStart + workloadMarker.length, namespaceStart) : "";
+  const workloadEnd = mountStart > workloadStart ? mountStart : namespaceStart;
+  const workloadPart = workloadStart >= 0 && workloadEnd > workloadStart ? output.slice(workloadStart + workloadMarker.length, workloadEnd) : "";
+  const mountPart = mountStart >= 0 && namespaceStart > mountStart ? output.slice(mountStart + mountMarker.length, namespaceStart) : "";
   const namespacePart = namespaceStart >= 0 && deviceStart > namespaceStart ? output.slice(namespaceStart + namespaceMarker.length, deviceStart) : "";
   const deviceEnd = containerStart > deviceStart ? containerStart : doneStart;
   const devicePart = deviceStart >= 0 && deviceEnd > deviceStart ? output.slice(deviceStart + deviceMarker.length, deviceEnd) : "";
@@ -439,6 +583,37 @@ function parseProbe(output) {
   const deviceProcessStart = devicePart.indexOf(deviceProcessMarker);
   const deviceMapPart = deviceProcessStart >= 0 ? devicePart.slice(0, deviceProcessStart) : "";
   const deviceProcessPart = deviceProcessStart >= 0 ? devicePart.slice(deviceProcessStart + deviceProcessMarker.length) : "";
+  const decodeMountPath = (value) => String(value || "").replace(/\\\\([0-7]{3})/g, (_, octal) => String.fromCharCode(Number.parseInt(octal, 8)));
+  const mountsByPid = new Map();
+  for (const line of mountPart.split(/\r?\n/)) {
+    const [pid, pointValue, rootValue, sourceValue] = line.split("\t");
+    if (!/^\d+$/.test(pid || "")) continue;
+    const point = decodeMountPath(pointValue);
+    const root = decodeMountPath(rootValue);
+    const source = decodeMountPath(sourceValue);
+    if (!point.startsWith("/") || point.length > 1000 || root.length > 1000 || source.length > 1000) continue;
+    const mounts = mountsByPid.get(Number(pid)) || [];
+    mounts.push({ point, root, source });
+    mountsByPid.set(Number(pid), mounts);
+  }
+  const resolveMountUser = (pid, cwd = null) => {
+    let mounts = mountsByPid.get(Number(pid)) || [];
+    if (cwd) {
+      const covering = mounts.filter(({ point }) => cwd === point || cwd.startsWith(`${point.replace(/\/+$/, "")}/`));
+      if (covering.length) {
+        const longestPoint = Math.max(...covering.map(({ point }) => point.length));
+        mounts = covering.filter(({ point }) => point.length === longestPoint);
+      }
+    }
+    const users = new Set();
+    for (const mount of mounts) {
+      for (const value of [mount.root, mount.source]) {
+        const user = inferUserFromPath(value);
+        if (user) users.add(user);
+      }
+    }
+    return users.size === 1 ? [...users][0] : null;
+  };
   const normalizeProcessCommand = (value) => String(value || "").trim().replace(/\s+/g, " ").slice(0, 700);
   const containerCwdsByCommand = new Map();
   for (const line of containerPart.split(/\r?\n/)) {
@@ -463,12 +638,13 @@ function parseProbe(output) {
     if (match) {
       const [user, pid, elapsed, command] = match.slice(1);
       const cwd = resolveProcessCwd(null, command);
+      const mountUser = resolveMountUser(Number(pid), cwd);
       owners.set(Number(pid), {
         user,
         elapsed,
         command,
         cwd,
-        ...buildAttribution({ systemAccount: user, command, cwd }),
+        ...buildAttribution({ systemAccount: user, command, cwd, mountUser }),
       });
     }
   }
@@ -522,6 +698,7 @@ function parseProbe(output) {
       systemAccount: workload.user,
       command: workload.command,
       cwd: workload.cwd,
+      mountUser: resolveMountUser(workload.pid, workload.cwd),
     }));
     workloads.push(workload);
     workloadsByExactPid.set(workload.pid, workload);
@@ -541,6 +718,7 @@ function parseProbe(output) {
           systemAccount: workload.user,
           command: workload.command,
           cwd: workload.cwd,
+          mountUser: resolveMountUser(workload.pid, workload.cwd),
           inheritedTaskUser: parent.attributionEvidence.taskUser,
         }));
         break;
@@ -559,7 +737,7 @@ function parseProbe(output) {
     const hostPid = namespacePids[0] || Number(pid);
     const command = commandParts.join("\t");
     const resolvedCwd = resolveProcessCwd(cwd, command);
-    const attribution = buildAttribution({ systemAccount: user, command, cwd: resolvedCwd });
+    const attribution = buildAttribution({ systemAccount: user, command, cwd: resolvedCwd, mountUser: resolveMountUser(Number(pid), resolvedCwd) });
     const evidence = {
       user,
       pid: Number(pid),
@@ -588,7 +766,7 @@ function parseProbe(output) {
     const hostPid = namespacePids[0] || Number(pid);
     const command = commandParts.join("\t");
     const resolvedCwd = resolveProcessCwd(cwd, command);
-    const attribution = buildAttribution({ systemAccount: user, command, cwd: resolvedCwd });
+    const attribution = buildAttribution({ systemAccount: user, command, cwd: resolvedCwd, mountUser: resolveMountUser(Number(pid), resolvedCwd) });
     deviceProcesses.set(Number(pid), {
       user,
       pid: Number(pid),
@@ -754,45 +932,74 @@ async function probe(node, requestedTimeoutMs = null) {
   }
 }
 
-const server = createServer(async (request, response) => {
-  const origin = request.headers.origin;
-  if (origin && isAllowedOrigin(origin)) {
-    response.setHeader("Access-Control-Allow-Origin", origin);
-    response.setHeader("Vary", "Origin");
-  }
-  if (request.method === "OPTIONS") return json(response, 204, {});
-  const url = new URL(request.url || "/", `http://${HOST}:${PORT}`);
-  try {
-    if (request.method === "GET" && url.pathname === "/api/health") return json(response, 200, { ok: true });
-    if (request.method === "GET" && url.pathname === "/api/nodes") return json(response, 200, await readConfig());
-    if (request.method === "GET" && url.pathname === "/api/status") {
-      const config = await readConfig();
-      const requestedNode = url.searchParams.get("node");
-      const requestedTimeoutMs = parseTimeoutMs(url.searchParams.get("timeoutSeconds"));
-      const enabled = config.nodes.filter((node) => node.enabled !== false && (!requestedNode || node.id === requestedNode));
-      if (requestedNode && enabled.length === 0) return json(response, 404, { error: `找不到已启用的节点：${requestedNode}` });
-      const statuses = await Promise.all(enabled.map((node) => probe(node, requestedTimeoutMs)));
-      return json(response, 200, { statuses });
-    }
-    if (request.method === "PUT" && url.pathname === "/api/nodes") {
-      let body = "";
-      for await (const chunk of request) {
-        body += chunk;
-        if (body.length > 1_000_000) throw new Error("请求内容过大");
-      }
-      const nodes = validateNodes(JSON.parse(body));
-      const config = { nodes };
-      await writeFile(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-      return json(response, 200, config);
-    }
-    return json(response, 404, { error: "Not found" });
-  } catch (error) {
-    return json(response, 400, { error: error instanceof Error ? error.message : String(error) });
-  }
-});
+const collectNodeStatus = createNodeCollector(probe);
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  server.listen(PORT, HOST, () => console.log(`GPU Watch API: http://${HOST}:${PORT}`));
+function createApiServer({ getConfig = readConfig, collectNode = collectNodeStatus, getAccount = () => userInfo().username } = {}) {
+  return createServer(async (request, response) => {
+    const origin = request.headers.origin;
+    if (origin && isAllowedOrigin(origin)) {
+      response.setHeader("Access-Control-Allow-Origin", origin);
+      response.setHeader("Vary", "Origin");
+    }
+    if (request.method === "OPTIONS") return json(response, 204, {});
+    const url = new URL(request.url || "/", `http://${HOST}:${PORT}`);
+    try {
+      if (request.method === "GET" && url.pathname === "/api/health") return json(response, 200, { ok: true });
+      if (request.method === "GET" && url.pathname === "/api/profile") return json(response, 200, { account: getAccount() });
+      if (request.method === "GET" && url.pathname === "/api/nodes") return json(response, 200, await getConfig());
+      if (request.method === "GET" && url.pathname === "/api/status") {
+        const config = await getConfig();
+        const requestedNode = url.searchParams.get("node");
+        const requestedTimeoutMs = parseTimeoutMs(url.searchParams.get("timeoutSeconds"));
+        const enabled = config.nodes.filter((node) => node.enabled !== false && (!requestedNode || node.id === requestedNode));
+        if (requestedNode && enabled.length === 0) return json(response, 404, { error: `找不到已启用的节点：${requestedNode}` });
+        const statuses = await Promise.all(enabled.map((node) => collectNode(node, requestedTimeoutMs)));
+        return json(response, 200, { statuses });
+      }
+      if (request.method === "PUT" && url.pathname === "/api/nodes") {
+        let body = "";
+        for await (const chunk of request) {
+          body += chunk;
+          if (body.length > 1_000_000) throw new Error("请求内容过大");
+        }
+        const nodes = validateNodes(JSON.parse(body));
+        const config = { nodes };
+        await writeFile(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+        return json(response, 200, config);
+      }
+      return json(response, 404, { error: "Not found" });
+    } catch (error) {
+      return json(response, 400, { error: error instanceof Error ? error.message : String(error) });
+    }
+  });
 }
 
-export { buildContainerCwdQuery, containerCwdQuery, deviceQuery, parseProbe, parseTimeoutMs, relayRemoteProbe, remoteProbe };
+function startApiServer({ server = createApiServer(), runtime = process, log = console.log, logError = console.error } = {}) {
+  if (runtime.connected) {
+    // A detached API must not outlive the launcher that owns its IPC channel.
+    runtime.once("disconnect", () => runtime.exit(runtime.exitCode ?? 0));
+  }
+  const fail = (error) => {
+    logError(error.code === "EADDRINUSE"
+      ? `GPU Watch API 启动失败：${HOST}:${PORT} 已被占用。若 watch4gpu 已在运行，请使用已有页面；需要重启时，请先在原终端按 Ctrl+C 停止旧实例。`
+      : `GPU Watch API 启动失败：${error.message}`);
+    runtime.exitCode = 1;
+    if (runtime.connected) runtime.disconnect();
+  };
+  server.once("error", fail);
+  try {
+    server.listen(PORT, HOST, () => {
+      log(`GPU Watch API: http://${HOST}:${PORT}`);
+      if (runtime.connected) runtime.send({ type: "watch4gpu:api-ready" });
+    });
+  } catch (error) {
+    fail(error);
+  }
+  return server;
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startApiServer();
+}
+
+export { buildContainerCwdQuery, containerCwdQuery, createApiServer, deviceQuery, mountInfoQuery, parseProbe, parseTimeoutMs, relayRemoteProbe, relayRemoteProbeSteps, relayShellReady, remoteProbe, run, runRelay, startApiServer };

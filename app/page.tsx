@@ -2,6 +2,9 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import userNames from "@/data/user-names.json";
+import { createNodePoller } from "@/lib/node-poller.mjs";
+import ThemeToggle from "./theme-toggle";
+import MyGpus from "./my-gpus";
 
 type NodeMode = "direct" | "relay";
 type AttributionSource = "pid" | "nspid" | "device" | "cuda-env" | "path" | "parent" | "node" | "account" | null;
@@ -23,7 +26,9 @@ type NodeConfig = {
   port?: number;
   gatewayHost?: string;
   gpuNodeId?: string;
+  loginArg?: string;
   loginScript?: string;
+  relayTransport?: "shell" | "command";
   enabled: boolean;
 };
 
@@ -81,10 +86,18 @@ type NodeStatus = {
   ok: boolean;
   checkedAt: string;
   latencyMs: number;
+  refreshFailed?: boolean;
   hostname?: string;
   gpus: GpuInfo[];
   workloads?: WorkloadInfo[];
   error?: string;
+};
+
+type UserGpuFilterOption = {
+  id: string;
+  label: string;
+  accounts: string[];
+  gpuCount: number;
 };
 
 const API = process.env.NEXT_PUBLIC_WATCH4GPU_API_URL || "http://127.0.0.1:8787";
@@ -124,7 +137,9 @@ const emptyNode: NodeConfig = {
   port: 22,
   gatewayHost: "",
   gpuNodeId: "",
+  loginArg: "",
   loginScript: "~/login.sh",
+  relayTransport: "shell",
   enabled: true,
 };
 
@@ -150,12 +165,17 @@ function attributedUserLabel(user?: string | null, evidence?: AttributionEvidenc
   return evidence?.conflict ? `可能是 @${display}` : `@${display}`;
 }
 
+function taskEvidenceLabel(evidence: AttributionEvidence) {
+  if (!evidence.taskSources.includes("mount")) return "任务目录";
+  return evidence.taskSources.some((source) => source !== "mount") ? "任务目录/挂载源" : "挂载源";
+}
+
 function attributionEvidenceTitle(user?: string | null, evidence?: AttributionEvidence | null) {
   if (!evidence) return null;
   const details = [
     evidence.systemAccount && `系统账户 ${evidence.systemAccount}`,
     evidence.environmentUser && `环境 ${evidence.environmentUser}`,
-    evidence.taskUser && `任务目录 ${evidence.taskUser}`,
+    evidence.taskUser && `${taskEvidenceLabel(evidence)} ${evidence.taskUser}`,
   ].filter(Boolean).join(" / ");
   if (evidence.conflict) {
     return `证据存在冲突：${details}。当前仅能判断可能是 ${normalizeUser(user)}，无法由进程信息确认实际操作者。`;
@@ -168,7 +188,7 @@ function AttributionEvidenceList({ evidence }: { evidence?: AttributionEvidence 
   const items = [
     evidence.systemAccount && { kind: "system", label: "系统账户", value: evidence.systemAccount },
     evidence.environmentUser && { kind: "environment", label: "环境", value: evidence.environmentUser },
-    evidence.taskUser && { kind: "task", label: "任务目录", value: evidence.taskUser },
+    evidence.taskUser && { kind: "task", label: taskEvidenceLabel(evidence), value: evidence.taskUser },
   ].filter((item): item is { kind: string; label: string; value: string } => Boolean(item));
   return (
     <span className="attribution-evidence" role="list" aria-label="进程归属证据">
@@ -203,6 +223,40 @@ function isFreeGpu(gpu: GpuInfo) {
   return gpu.utilization <= 5 && gpu.memoryUsed <= 1024 && gpu.processes.length === 0;
 }
 
+function buildUserGpuFilterOptions(gpus: GpuInfo[]) {
+  const groups = new Map<string, { label: string; accounts: Set<string> }>();
+  function addAccount(rawAccount: string, rawLabel?: string) {
+    const account = normalizeUser(rawAccount);
+    if (!account) return;
+    const label = rawLabel?.trim() || `@${account}`;
+    const groupKey = label.toLocaleLowerCase("zh-CN");
+    const group = groups.get(groupKey) || { label, accounts: new Set<string>() };
+    group.accounts.add(account);
+    groups.set(groupKey, group);
+  }
+  for (const [account, displayName] of Object.entries(USER_NAMES)) addAccount(account, displayName);
+  for (const gpu of gpus) {
+    for (const process of gpu.processes) {
+      const account = normalizeUser(process.attributedUser);
+      if (account) addAccount(account, USER_NAMES[account]);
+    }
+  }
+  return Array.from(groups.entries(), ([groupKey, group]): UserGpuFilterOption => ({
+    id: encodeURIComponent(groupKey),
+    label: group.label,
+    accounts: Array.from(group.accounts).sort(),
+    gpuCount: gpus.filter((gpu) => gpu.processes.some((process) => group.accounts.has(normalizeUser(process.attributedUser)))).length,
+  })).sort((a, b) => b.gpuCount - a.gpuCount || a.label.localeCompare(b.label, "zh-CN"));
+}
+
+function gpuMatchesAccounts(gpu: GpuInfo, accounts: ReadonlySet<string>) {
+  return gpu.processes.some((process) => accounts.has(normalizeUser(process.attributedUser)));
+}
+
+function workloadMatchesAccounts(workload: WorkloadInfo, accounts: ReadonlySet<string>) {
+  return accounts.has(normalizeUser(workload.attributedUser || workload.user));
+}
+
 function relativeTime(iso: string | undefined, now: number) {
   if (!iso) return "尚未更新";
   const seconds = Math.max(0, Math.floor((now - new Date(iso).getTime()) / 1000));
@@ -218,7 +272,7 @@ function MetricRing({ value, label }: { value: number; label: string }) {
   return (
     <div
       className="metric-ring"
-      style={{ background: `conic-gradient(${tone} ${safe}%, rgba(29,29,31,.075) 0)` }}
+      style={{ background: `conic-gradient(${tone} ${safe}%, var(--metric-track) 0)` }}
     role="img"
     aria-label={`${label} ${Math.round(safe)}%`}
     >
@@ -383,7 +437,7 @@ function CollectionPicker({
       <span className={`picker-chevron ${open ? "open" : ""}`} aria-hidden="true">⌄</span>
     </button>
     {open && <div className="collection-popover" id={id} ref={popoverRef} role="dialog" aria-label={`设置${label}`}>
-      <div className="collection-popover-copy"><strong>{label}</strong><span>{icon === "refresh" ? "选择数据自动更新频率" : "单个节点的最长等待时间"}</span></div>
+      <div className="collection-popover-copy"><strong>{label}</strong><span>{icon === "refresh" ? "每个节点采集完成后的等待时间" : "单个节点的最长等待时间"}</span></div>
       <div className={`collection-options options-${options.length}`} role="group" aria-label={label}>
         {options.map((option) => <button
           type="button"
@@ -399,6 +453,82 @@ function CollectionPicker({
   </div>;
 }
 
+function UserFilter({
+  options,
+  value,
+  allGpuCount,
+  onChange,
+}: {
+  options: UserGpuFilterOption[];
+  value: string;
+  allGpuCount: number;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const controlRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const selected = options.find((option) => option.id === value);
+
+  useEffect(() => {
+    if (value && !selected) onChange("");
+  }, [onChange, selected, value]);
+
+  useEffect(() => {
+    if (!open) return;
+    const focusTimer = window.requestAnimationFrame(() => {
+      popoverRef.current?.querySelector<HTMLButtonElement>("button.active")?.focus();
+    });
+    function closeMenu(event: PointerEvent) {
+      if (!controlRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      triggerRef.current?.focus();
+    }
+    document.addEventListener("pointerdown", closeMenu);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusTimer);
+      document.removeEventListener("pointerdown", closeMenu);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  function choose(nextValue: string) {
+    onChange(nextValue);
+    setOpen(false);
+    window.requestAnimationFrame(() => triggerRef.current?.focus());
+  }
+
+  return <div className="user-filter" ref={controlRef}>
+    <button
+      className={`user-filter-trigger ${selected ? "filtered" : ""}`}
+      type="button"
+      ref={triggerRef}
+      aria-label={`按用户筛选：${selected?.label || "全部用户"}`}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      aria-controls="user-filter-menu"
+      onClick={() => setOpen((current) => !current)}
+    >
+      <span className="user-filter-icon" aria-hidden="true">人</span>
+      <strong>{selected?.label || "全部用户"}</strong>
+      <small>{selected?.gpuCount ?? allGpuCount} 块</small>
+      <span className={`picker-chevron ${open ? "open" : ""}`} aria-hidden="true">⌄</span>
+    </button>
+    {open && <div className="user-filter-popover" id="user-filter-menu" ref={popoverRef} role="dialog" aria-label="选择要查看的用户">
+      <div className="user-filter-copy"><strong>按人名筛选</strong><span>只显示所选用户正在使用的 GPU</span></div>
+      <div className="user-filter-options" role="group" aria-label="用户">
+        <button type="button" className={!value ? "active" : ""} aria-pressed={!value} onClick={() => choose("")}><span>全部用户</span><small>{allGpuCount} 块 GPU</small></button>
+        {options.map((option) => <button type="button" key={option.id} className={value === option.id ? "active" : ""} aria-pressed={value === option.id} onClick={() => choose(option.id)}><span>{option.label}</span><small>{option.gpuCount} 块 GPU</small></button>)}
+      </div>
+    </div>}
+  </div>;
+}
+
 export default function Home() {
   const [nodes, setNodes] = useState<NodeConfig[]>([]);
   const [statuses, setStatuses] = useState<Record<string, NodeStatus>>({});
@@ -407,6 +537,7 @@ export default function Home() {
   const [configError, setConfigError] = useState("");
   const [statusError, setStatusError] = useState("");
   const [query, setQuery] = useState("");
+  const [selectedUserId, setSelectedUserId] = useState("");
   const [intervalSeconds, setIntervalSeconds] = useState(30);
   const [timeoutSeconds, setTimeoutSeconds] = useState(DEFAULT_TIMEOUT_SECONDS);
   const [settingsReady, setSettingsReady] = useState(false);
@@ -421,36 +552,43 @@ export default function Home() {
   const modalRef = useRef<HTMLElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const timeoutSecondsRef = useRef(DEFAULT_TIMEOUT_SECONDS);
+  const intervalSecondsRef = useRef(30);
+  const nodesRef = useRef<NodeConfig[]>([]);
+  const failedRequestsRef = useRef(new Set<string>());
+  const pollerRef = useRef<ReturnType<typeof createNodePoller<NodeConfig, NodeStatus>> | null>(null);
+
+  const applyNodes = useCallback((next: NodeConfig[]) => {
+    const previous = new Map(nodesRef.current.map((node) => [node.id, JSON.stringify(node)]));
+    nodesRef.current = next;
+    setNodes(next);
+    // Removed or edited targets must not keep results from their old configuration.
+    setStatuses((current) => Object.fromEntries(next
+      .filter((node) => node.enabled && previous.get(node.id) === JSON.stringify(node) && current[node.id])
+      .map((node) => [node.id, current[node.id]])));
+    const enabledIds = new Set(next.filter((node) => node.enabled).map((node) => node.id));
+    for (const id of failedRequestsRef.current) {
+      if (!enabledIds.has(id)) failedRequestsRef.current.delete(id);
+    }
+    setStatusError(failedRequestsRef.current.size ? "部分节点暂时无法刷新" : "");
+    pollerRef.current?.setNodes(next.filter((node) => node.enabled));
+  }, []);
 
   const loadNodes = useCallback(async () => {
     try {
       const response = await fetch(`${API}/api/nodes`, { cache: "no-store" });
       if (!response.ok) throw new Error("无法读取节点配置");
       const data = await response.json();
-      setNodes(data.nodes);
+      applyNodes(data.nodes);
       setConfigError("");
     } catch {
       setConfigError("无法读取节点配置");
-    }
-  }, []);
-
-  const refresh = useCallback(async (silent = false, timeoutOverride?: number) => {
-    if (!silent) setRefreshing(true);
-    try {
-      const params = new URLSearchParams({ timeoutSeconds: String(timeoutOverride ?? timeoutSecondsRef.current) });
-      const response = await fetch(`${API}/api/status?${params}`, { cache: "no-store" });
-      if (!response.ok) throw new Error("刷新失败");
-      const data = await response.json();
-      const next = Object.fromEntries((data.statuses as NodeStatus[]).map((item) => [item.nodeId, item]));
-      setStatuses(next);
-      setStatusError("");
-      setNow(Date.now());
-    } catch {
-      setStatusError("本地采集服务未连接");
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
+  }, [applyNodes]);
+
+  const refresh = useCallback(async (nodeId?: string) => {
+    await pollerRef.current?.refresh(nodeId);
   }, []);
 
   useEffect(() => {
@@ -471,15 +609,42 @@ export default function Home() {
 
   useEffect(() => {
     if (!settingsReady) return;
-    const timer = window.setTimeout(() => { void Promise.all([loadNodes(), refresh()]); }, 0);
-    return () => window.clearTimeout(timer);
-  }, [loadNodes, refresh, settingsReady]);
-
-  useEffect(() => {
-    if (!intervalSeconds) return;
-    const timer = window.setInterval(() => { void refresh(true); }, intervalSeconds * 1000);
-    return () => window.clearInterval(timer);
-  }, [intervalSeconds, refresh]);
+    const poller = createNodePoller<NodeConfig, NodeStatus>({
+      poll: async (node) => {
+        const params = new URLSearchParams({ timeoutSeconds: String(timeoutSecondsRef.current), node: node.id });
+        const response = await fetch(`${API}/api/status?${params}`, { cache: "no-store" });
+        if (!response.ok) throw new Error("刷新失败");
+        const data = await response.json();
+        const status = (data.statuses as NodeStatus[]).find((item) => item.nodeId === node.id);
+        if (!status) throw new Error("未收到节点采集结果");
+        return status;
+      },
+      onResult: (node, status) => {
+        setStatuses((current) => ({ ...current, [node.id]: status }));
+        failedRequestsRef.current.delete(node.id);
+        setStatusError(failedRequestsRef.current.size ? "部分节点暂时无法刷新" : "");
+        setNow(Date.now());
+      },
+      onError: (node) => {
+        failedRequestsRef.current.add(node.id);
+        setStatuses((current) => current[node.id]?.ok ? ({ ...current, [node.id]: { ...current[node.id], refreshFailed: true } }) : ({
+          ...current,
+          [node.id]: { nodeId: node.id, ok: false, checkedAt: new Date().toISOString(), latencyMs: 0, gpus: [], error: "暂时无法从本地采集服务获取此节点的数据" },
+        }));
+        setStatusError("部分节点暂时无法刷新");
+      },
+      onActivity: (count) => setRefreshing(count > 0),
+    });
+    pollerRef.current = poller;
+    poller.setInterval(intervalSecondsRef.current * 1000);
+    poller.setNodes(nodesRef.current.filter((node) => node.enabled));
+    const timer = window.setTimeout(() => { void loadNodes(); }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      poller.stop();
+      pollerRef.current = null;
+    };
+  }, [loadNodes, settingsReady]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 10_000);
@@ -528,17 +693,26 @@ export default function Home() {
     return nodes.filter((node) => [node.name, node.sshHost, node.hostName, node.gpuNodeId].some((value) => value?.toLowerCase().includes(needle)));
   }, [nodes, query]);
 
-  const rankedNodes = useMemo(() => filteredNodes.map((node, originalIndex) => {
+  const enabledNodes = useMemo(() => nodes.filter((node) => node.enabled), [nodes]);
+  const allGpus = useMemo(() => enabledNodes.flatMap((node) => statuses[node.id]?.ok ? statuses[node.id].gpus : []), [enabledNodes, statuses]);
+  const userFilterOptions = useMemo(() => buildUserGpuFilterOptions(allGpus), [allGpus]);
+  const selectedUser = useMemo(() => userFilterOptions.find((option) => option.id === selectedUserId), [selectedUserId, userFilterOptions]);
+  const selectedAccounts = useMemo(() => new Set(selectedUser?.accounts || []), [selectedUser]);
+  const rankedNodes = useMemo(() => filteredNodes.map((node) => {
     const status = statuses[node.id];
-    const freeGpuCount = status?.ok ? status.gpus.filter(isFreeGpu).length : 0;
-    return { node, originalIndex, freeGpuCount };
-  }).sort((a, b) => b.freeGpuCount - a.freeGpuCount || a.originalIndex - b.originalIndex), [filteredNodes, statuses]);
-
-  const enabledNodes = nodes.filter((node) => node.enabled);
-  const allGpus = enabledNodes.flatMap((node) => statuses[node.id]?.ok ? statuses[node.id].gpus : []);
+    const allNodeGpus = status?.ok ? status.gpus : [];
+    const visibleGpus = selectedUser ? allNodeGpus.filter((gpu) => gpuMatchesAccounts(gpu, selectedAccounts)) : allNodeGpus;
+    const visibleWorkloads = selectedUser ? (status?.workloads || []).filter((workload) => workloadMatchesAccounts(workload, selectedAccounts)) : status?.workloads || [];
+    const freeGpuCount = visibleGpus.filter(isFreeGpu).length;
+    return { node, originalIndex: nodes.indexOf(node), freeGpuCount, visibleGpus, visibleWorkloads };
+  }).filter(({ visibleGpus }) => !selectedUser || visibleGpus.length > 0)
+    .sort((a, b) => selectedUser
+      ? b.visibleGpus.length - a.visibleGpus.length || a.originalIndex - b.originalIndex
+      : b.freeGpuCount - a.freeGpuCount || a.originalIndex - b.originalIndex), [filteredNodes, nodes, selectedAccounts, selectedUser, statuses]);
   const onlineCount = enabledNodes.filter((node) => statuses[node.id]?.ok).length;
   const freeGpuTotal = allGpus.filter(isFreeGpu).length;
   const occupiedGpuTotal = allGpus.length - freeGpuTotal;
+  const visibleGpuTotal = rankedNodes.reduce((total, node) => total + node.visibleGpus.length, 0);
   const avgUtil = allGpus.length ? Math.round(allGpus.reduce((sum, gpu) => sum + gpu.utilization, 0) / allGpus.length) : 0;
   const lastChecked = enabledNodes.map((node) => statuses[node.id]?.checkedAt).filter(Boolean).sort().at(-1);
   const serviceError = statusError || configError;
@@ -567,7 +741,7 @@ export default function Home() {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "保存失败");
-    setNodes(result.nodes);
+    applyNodes(result.nodes);
   }
 
   async function submitNode(event: FormEvent) {
@@ -579,7 +753,6 @@ export default function Home() {
       const next = editingIndex == null ? [...nodes, normalized] : nodes.map((node, index) => index === editingIndex ? normalized : node);
       await saveNodes(next);
       closeEditor();
-      await refresh();
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : "保存失败");
     } finally {
@@ -592,7 +765,6 @@ export default function Home() {
     try {
       await saveNodes(nodes.filter((_, itemIndex) => itemIndex !== index));
       setDeleteIndex(null);
-      await refresh();
     } catch (error) {
       setStatusError(error instanceof Error ? error.message : "删除失败");
     } finally {
@@ -608,14 +780,20 @@ export default function Home() {
     } catch {
       // Keep the in-memory choice even when persistence is unavailable.
     }
-    void refresh(false, seconds);
+    void refresh();
+  }
+
+  function chooseInterval(seconds: number) {
+    intervalSecondsRef.current = seconds;
+    setIntervalSeconds(seconds);
+    pollerRef.current?.setInterval(seconds * 1000);
   }
 
   function nodeState(node: NodeConfig, status?: NodeStatus) {
     if (!node.enabled) return { label: "已停用", tone: "disabled" };
     if (!status) return { label: "正在连接", tone: "connecting" };
     if (!status.ok) return { label: "无法连接", tone: "error" };
-    const staleAfter = intervalSeconds ? Math.max(75_000, intervalSeconds * 2500) : 180_000;
+    const staleAfter = intervalSeconds ? Math.max(75_000, (intervalSeconds + timeoutSeconds + 10) * 1000) : 180_000;
     if (now - new Date(status.checkedAt).getTime() > staleAfter) return { label: "数据已过期", tone: "stale" };
     return { label: "在线", tone: "online" };
   }
@@ -626,7 +804,8 @@ export default function Home() {
         <a className="brand" href="#top" aria-label="GPU Watch 首页"><span className="brand-mark">W4</span><span>GPU Watch<small>本地 GPU 控制台</small></span></a>
         <label className="search"><span aria-hidden="true">⌕</span><input aria-label="搜索节点" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索节点、IP 或编号" /></label>
         <div className="top-actions">
-          <button className="icon-button" onClick={() => void refresh()} disabled={refreshing} aria-label="立即刷新"><span aria-hidden="true">{refreshing ? "…" : "↻"}</span></button>
+          <ThemeToggle />
+          <button className="icon-button" onClick={() => void refresh()} disabled={!settingsReady} aria-busy={refreshing} aria-label="立即刷新"><span aria-hidden="true">{refreshing ? "…" : "↻"}</span></button>
           <button className="primary add-button" onClick={openCreate}><span aria-hidden="true">＋</span><span className="button-text">添加节点</span></button>
         </div>
       </header>
@@ -644,23 +823,28 @@ export default function Home() {
           <div><span>平均利用率</span><strong>{avgUtil}<small>%</small></strong></div>
         </div>
         <div className="collection-controls" aria-label="采集设置">
-          <CollectionPicker id="refresh-menu" label="自动刷新" value={intervalSeconds} options={REFRESH_OPTIONS} icon="refresh" helperText="暂停后仍可使用顶部按钮手动刷新。" onChange={setIntervalSeconds} />
+          <CollectionPicker id="refresh-menu" label="刷新间隔" value={intervalSeconds} options={REFRESH_OPTIONS} icon="refresh" helperText="各节点独立刷新，采集结束后再等待所选时间。暂停后仍可使用顶部按钮手动刷新。" onChange={chooseInterval} />
           <CollectionPicker id="timeout-menu" label="超时上限" value={timeoutSeconds} options={TIMEOUT_OPTIONS} icon="timeout" helperText="较慢的中转节点建议选择 45 秒以上。" disabled={!settingsReady} onChange={chooseTimeout} />
         </div>
       </section>
 
       {serviceError && nodes.length > 0 && <div className="notice" role="alert"><span aria-hidden="true">!</span><div><strong>暂时无法刷新</strong><p>继续显示上次成功采集的数据。</p></div><button onClick={() => { void loadNodes(); void refresh(); }}>重试</button></div>}
 
+      <MyGpus nodes={nodes} statuses={statuses} names={USER_NAMES} api={API} now={now} staleAfter={intervalSeconds ? Math.max(75_000, (intervalSeconds + timeoutSeconds + 10) * 1000) : 180_000} />
+
       <section className="section-head" aria-labelledby="nodes-heading">
         <div className="section-heading">
           <div>
-            <h2 id="nodes-heading">{query ? `${filteredNodes.length} 个匹配节点` : `${nodes.length} 个计算节点`}</h2>
-            <p>{query ? `搜索“${query}”` : "按可用资源排序，空闲节点优先"}</p>
+            <h2 id="nodes-heading">{selectedUser ? `${visibleGpuTotal} 块 ${selectedUser.label} 的 GPU` : query ? `${filteredNodes.length} 个匹配节点` : `${nodes.length} 个计算节点`}</h2>
+            <p>{selectedUser ? `${query ? `搜索“${query}” · ` : ""}只显示该用户对应的 GPU 卡片` : query ? `搜索“${query}”` : "按可用资源排序，空闲节点优先"}</p>
           </div>
         </div>
-        <div className={`availability-status ${freeGpuTotal ? "available" : allGpus.length ? "busy" : "pending"}`}>
-          <span className="availability-dot" aria-hidden="true" />
-          <span>{freeGpuTotal ? `${freeGpuTotal} 块 GPU 可立即使用` : allGpus.length ? "暂无空闲 GPU" : "等待资源数据"}</span>
+        <div className="section-tools">
+          <UserFilter options={userFilterOptions} value={selectedUserId} allGpuCount={allGpus.length} onChange={setSelectedUserId} />
+          <div className={`availability-status ${freeGpuTotal ? "available" : allGpus.length ? "busy" : "pending"}`}>
+            <span className="availability-dot" aria-hidden="true" />
+            <span>{freeGpuTotal ? `${freeGpuTotal} 块 GPU 可立即使用` : allGpus.length ? "暂无空闲 GPU" : "等待资源数据"}</span>
+          </div>
         </div>
       </section>
 
@@ -669,9 +853,11 @@ export default function Home() {
 
         {!loading && serviceError && nodes.length === 0 && <div className="connection-state" role="alert"><span aria-hidden="true">!</span><h2>无法连接本地采集服务</h2><p>请确认 <code>npm run watch4gpu</code> 正在运行，然后重试。</p><button className="primary" onClick={() => { void loadNodes(); void refresh(); }}>重新连接</button></div>}
 
-        {!loading && !serviceError && filteredNodes.length === 0 && <div className="empty-state"><span aria-hidden="true">◇</span><h2>{query ? "没有匹配的节点" : "还没有节点"}</h2><p>{query ? "换一个关键词，或清除搜索条件。" : "添加第一个计算节点，开始查看 GPU 状态。"}</p>{query ? <button onClick={() => setQuery("")}>清除搜索</button> : <button className="primary" onClick={openCreate}>添加节点</button>}</div>}
+        {!loading && !serviceError && !selectedUser && filteredNodes.length === 0 && <div className="empty-state"><span aria-hidden="true">◇</span><h2>{query ? "没有匹配的节点" : "还没有节点"}</h2><p>{query ? "换一个关键词，或清除搜索条件。" : "添加第一个计算节点，开始查看 GPU 状态。"}</p>{query ? <button onClick={() => setQuery("")}>清除搜索</button> : <button className="primary" onClick={openCreate}>添加节点</button>}</div>}
 
-        {rankedNodes.map(({ node, originalIndex, freeGpuCount }) => {
+        {!loading && !serviceError && selectedUser && rankedNodes.length === 0 && <div className="empty-state"><span aria-hidden="true">◇</span><h2>没有找到 {selectedUser.label} 的 GPU</h2><p>{query ? "当前搜索范围内没有对应的 GPU 卡片。" : "该用户目前没有可识别的 GPU 进程。"}</p><button onClick={() => setSelectedUserId("")}>显示全部用户</button></div>}
+
+        {rankedNodes.map(({ node, originalIndex, freeGpuCount, visibleGpus, visibleWorkloads }) => {
           const status = statuses[node.id];
           const state = nodeState(node, status);
           return (
@@ -683,12 +869,12 @@ export default function Home() {
 
               {!node.enabled ? <div className="state-message"><strong>这个节点已停用</strong><p>编辑节点可重新启用自动采集。</p></div> : status?.ok ? <>
                 <div className="node-summary">
-                  <div><strong>{freeGpuCount}</strong><span>/ {status.gpus.length} 块可用</span></div>
+                  <div>{selectedUser ? <><strong>{visibleGpus.length}</strong><span>块 {selectedUser.label} 的 GPU</span></> : <><strong>{freeGpuCount}</strong><span>/ {visibleGpus.length} 块可用</span></>}</div>
                   <p><span>{status.latencyMs} ms</span><span>{status.hostname || node.name}</span><span>{relativeTime(status.checkedAt, now)}更新</span></p>
                 </div>
-                <WorkloadDetails workloads={status.workloads || []} />
-                <div className="gpu-grid">{status.gpus.map((gpu) => <GpuTile gpu={gpu} key={gpu.uuid || gpu.index} />)}</div>
-              </> : status ? <div className="state-message error"><strong>无法连接节点</strong><p>{status.error}</p><button onClick={() => void refresh()}>重新尝试</button></div> : <div className="state-message"><strong>正在建立连接</strong><p>首次采集可能需要几秒钟。</p></div>}
+                <WorkloadDetails workloads={visibleWorkloads} />
+                <div className="gpu-grid">{visibleGpus.map((gpu) => <GpuTile gpu={gpu} key={gpu.uuid || gpu.index} />)}</div>
+              </> : status ? <div className="state-message error"><strong>无法连接节点</strong><p>{status.error}</p><button onClick={() => void refresh(node.id)}>重新尝试</button></div> : <div className="state-message"><strong>正在建立连接</strong><p>首次采集可能需要几秒钟。</p></div>}
 
               {deleteIndex === originalIndex && <div className="delete-confirm" role="alertdialog" aria-label={`确认删除 ${node.name}`}><p><strong>删除“{node.name}”？</strong><span>节点配置将从本机移除。</span></p><div><button onClick={() => setDeleteIndex(null)} disabled={deleting}>取消</button><button className="danger" onClick={() => void deleteNode(originalIndex)} disabled={deleting}>{deleting ? "正在删除…" : "确认删除"}</button></div></div>}
             </article>
@@ -707,7 +893,7 @@ export default function Home() {
               <label className={draft.mode === "relay" ? "active" : ""}><input type="radio" checked={draft.mode === "relay"} onChange={() => setDraft({ ...draft, mode: "relay" })} />中转节点<small>登录网关后执行脚本</small></label>
             </div>
             <div className="form-grid">
-              <label>配置 ID<input data-autofocus required pattern="[A-Za-z0-9._-]+" value={draft.id} disabled={editingIndex != null} onChange={(event) => setDraft({ ...draft, id: event.target.value })} placeholder="iva-60" /><small>字母、数字、点、横线或下划线</small></label>
+              <label>配置 ID<input data-autofocus required pattern="[A-Za-z0-9._-]+" value={draft.id} disabled={editingIndex != null} onChange={(event) => setDraft({ ...draft, id: event.target.value })} placeholder="gpu-server-01" /><small>字母、数字、点、横线或下划线</small></label>
               <label>显示名称<input required value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} placeholder="GPU Server 01" /></label>
               {draft.mode === "direct" ? <>
                 <label className="wide">SSH Host 别名<input required value={draft.sshHost || ""} onChange={(event) => setDraft({ ...draft, sshHost: event.target.value })} placeholder="与 ~/.ssh/config 保持一致" /></label>
@@ -716,8 +902,10 @@ export default function Home() {
                 <label>端口<input type="number" min="1" max="65535" value={draft.port || 22} onChange={(event) => setDraft({ ...draft, port: Number(event.target.value) })} /></label>
               </> : <>
                 <label className="wide">网关 SSH Host<input required value={draft.gatewayHost || ""} onChange={(event) => setDraft({ ...draft, gatewayHost: event.target.value })} placeholder="gpu-gateway" /></label>
-                <label>GPU 节点编号<input required pattern="[0-9]+" value={draft.gpuNodeId || ""} onChange={(event) => setDraft({ ...draft, gpuNodeId: event.target.value })} placeholder="34" /></label>
+                <label>GPU 节点编号<input required pattern="[0-9]+" value={draft.gpuNodeId || ""} onChange={(event) => setDraft({ ...draft, gpuNodeId: event.target.value })} placeholder="01" /></label>
+                <label>脚本参数（可选）<input pattern="[A-Za-z0-9._-]+" value={draft.loginArg || ""} onChange={(event) => setDraft({ ...draft, loginArg: event.target.value })} placeholder="默认使用节点编号" /><small>脚本需要特殊参数时填写，例如 GPU01</small></label>
                 <label>远程登录脚本<input required value={draft.loginScript || ""} onChange={(event) => setDraft({ ...draft, loginScript: event.target.value })} placeholder="login.sh" /></label>
+                <label>采集通道<select value={draft.relayTransport || "shell"} onChange={(event) => setDraft({ ...draft, relayTransport: event.target.value === "command" ? "command" : "shell" })}><option value="shell">交互终端</option><option value="command">兼容命令通道</option></select><small>交互终端无法启动时使用。</small></label>
               </>}
             </div>
             <label className="toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} /><span aria-hidden="true" />启用自动采集</label>

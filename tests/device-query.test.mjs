@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
-import { buildContainerCwdQuery, containerCwdQuery, deviceQuery, parseProbe, parseTimeoutMs, relayRemoteProbe, remoteProbe } from "../server.mjs";
+import { buildContainerCwdQuery, containerCwdQuery, deviceQuery, mountInfoQuery, parseProbe, parseTimeoutMs, relayRemoteProbe, relayRemoteProbeSteps, relayShellReady, remoteProbe } from "../server.mjs";
 
 test("validates optional per-request timeout limits", () => {
   assert.equal(parseTimeoutMs(null), null);
@@ -11,6 +11,38 @@ test("validates optional per-request timeout limits", () => {
   assert.throws(() => parseTimeoutMs("4"), /5–120 秒/);
   assert.throws(() => parseTimeoutMs("121"), /5–120 秒/);
   assert.throws(() => parseTimeoutMs("25.5"), /整数秒/);
+});
+
+test("starts login_1 probes at the target shell without waiting for Conda", () => {
+  const shellRunningCd = "root@container:/public/project# cd /shared/users/alice\r\n";
+  const shellAfterCd = [
+    "root@container:/public/project# cd /shared/users/alice",
+    "cd /shared/users/alice",
+    "root@container:/shared/users/alice# ",
+  ].join("\r\n");
+  const condaReady = [
+    "root@container:/project# conda activate /envs/train",
+    "root@container:/project# ",
+  ].join("\n");
+
+  assert.equal(relayShellReady(shellRunningCd, "/shared/login_1.sh"), true);
+  assert.equal(relayShellReady(shellRunningCd, "/shared/login.sh"), false);
+  assert.equal(relayShellReady(shellAfterCd, "/shared/login_1.sh"), true);
+  assert.equal(relayShellReady(shellAfterCd, "/shared/login.sh"), false);
+  assert.equal(relayShellReady("root@container:/public/project# ", "/shared/login_1.sh"), false);
+  assert.equal(relayShellReady(condaReady, "/shared/login.sh"), true);
+});
+
+test("recognizes the shell handoff performed after login_new", () => {
+  const fakeCmd = "[fake_cmd GPU22]$ pexpect --kill_disabled -- /bin/bash\r\n";
+  const rootShell = `${fakeCmd}root@container:/public/project# `;
+
+  for (const script of ["/shared/login_new.sh", "/shared/login_new_expect.sh"]) {
+    assert.equal(relayShellReady(fakeCmd, script), false);
+    assert.equal(relayShellReady("root@gateway:/home/user# ", script), false);
+    assert.equal(relayShellReady(rootShell, script), true);
+  }
+  assert.equal(relayShellReady(rootShell, "/shared/login.sh"), false);
 });
 
 test("device query emits every GPU-PID mapping and queries unique PID metadata separately", () => {
@@ -31,13 +63,36 @@ test("container inspection batches validated PIDs and stays read-only", () => {
   assert.equal((containerCwdQuery.match(/docker exec/g) || []).length, 1);
   assert.match(containerCwdQuery, /\^\[0-9\]\+\$/);
   assert.match(remoteProbe, /__WATCH4GPU_CONTAINER_CWDS__/);
-  assert.match(relayRemoteProbe, /__WATCH4GPU_CONTAINER_CWDS__/);
+  assert.ok(relayRemoteProbeSteps.some(({ marker }) => marker === "__WATCH4GPU_CONTAINER_CWDS__"));
   assert.doesNotMatch(relayRemoteProbe, /docker exec/);
   assert.doesNotMatch(containerCwdQuery, /\b(?:sudo|su|rm|mv|cp|touch|tee|kill|pkill|renice)\b|sed\s+-i|docker\s+(?:stop|restart|kill|update)|(?:^|[;&|])\s*>[^&]/);
   const innerScript = containerCwdQuery.match(/sh -c '([^']+)' sh/)?.[1];
   assert.ok(innerScript);
   assert.equal(spawnSync("bash", ["-n"], { input: containerCwdQuery }).status, 0);
   assert.equal(spawnSync("sh", ["-n"], { input: innerScript }).status, 0);
+});
+
+test("mount inspection reads only identity-bearing process mounts", () => {
+  assert.match(mountInfoQuery, /nvidia-smi --query-compute-apps=pid/);
+  assert.match(mountInfoQuery, /\/proc\/\"\$pid\"\/mountinfo/);
+  assert.ok(mountInfoQuery.includes("shared"));
+  assert.doesNotMatch(mountInfoQuery, /ps -ww -e/);
+  assert.match(remoteProbe, /__WATCH4GPU_MOUNTS__/);
+  assert.ok(relayRemoteProbeSteps.some(({ marker }) => marker === "__WATCH4GPU_MOUNTS__"));
+  assert.doesNotMatch(mountInfoQuery, /\b(?:sudo|su|rm|mv|cp|touch|tee|kill|pkill|renice|docker)\b|sed\s+-i|(?:^|[;&|])\s*>[^&]/);
+  assert.equal(spawnSync("bash", ["-n"], { input: mountInfoQuery }).status, 0);
+});
+
+test("relay probe stays below the interactive terminal line limit", () => {
+  const lines = relayRemoteProbe.split("\r");
+  assert.deepEqual(lines, relayRemoteProbeSteps.map(({ command }) => command));
+  assert.equal(new Set(relayRemoteProbeSteps.map(({ marker }) => marker)).size, relayRemoteProbeSteps.length);
+  assert.ok(lines.length > 1);
+  assert.ok(lines.every((line) => Buffer.byteLength(line) <= 4095), `relay line lengths: ${lines.map((line) => Buffer.byteLength(line)).join(", ")}`);
+  for (const [index, line] of lines.entries()) {
+    assert.doesNotMatch(line, new RegExp(relayRemoteProbeSteps[index].marker));
+    assert.equal(spawnSync("bash", ["-n"], { input: line }).status, 0);
+  }
 });
 
 test("deep inspection users are configurable without embedding private accounts", () => {
@@ -176,8 +231,104 @@ test("uses a container cwd when host proc permissions hide the task directory", 
   assert.deepEqual(ownerOnlyProcess.attributionEvidence, workload.attributionEvidence);
 });
 
+test("attributes a root container task from its unambiguous NFS project mount", () => {
+  const command = "/opt/conda/envs/xwam/bin/python3.10 -u scripts/train_sft.py dataset=robodojo exp_name=robodojo_sft_1";
+  const output = [
+    "__WATCH4GPU_HOST__",
+    "gpu15",
+    "__WATCH4GPU_GPUS__",
+    "0, NVIDIA A800, GPU-0, 63, 100, 73616, 81920, 448, 400",
+    "__WATCH4GPU_PROCESSES__",
+    "GPU-0, 34670, /opt/conda/envs/xwam/bin/python3.10, 73598",
+    "__WATCH4GPU_OWNERS__",
+    `root 34670 05:12:47 ${command}`,
+    "__WATCH4GPU_WORKLOADS__",
+    `root\t34670\t34475\t34670\t34670\t05:12:47\t\t\t-\t-\t-\t-\t${command}`,
+    "__WATCH4GPU_MOUNTS__",
+    "34670\t/workspace/example-project\t/\tserver:/shared/users/example_user/example-project",
+    "__WATCH4GPU_NAMESPACES__",
+    "__WATCH4GPU_DEVICES__",
+    "__WATCH4GPU_DEVICE_PROCESSES__",
+    "__WATCH4GPU_CONTAINER_CWDS__",
+    "__WATCH4GPU_DONE__",
+    "",
+  ].join("\n");
+
+  const result = parseProbe(output);
+  const workload = result.workloads[0];
+  const process = result.gpus[0].processes[0];
+
+  assert.equal(workload.attributedUser, "example_user");
+  assert.deepEqual(workload.attributionEvidence, {
+    systemAccount: "root",
+    environmentUser: null,
+    taskUser: "example_user",
+    taskSources: ["mount"],
+    conflict: false,
+  });
+  assert.equal(process.attributedUser, "example_user");
+  assert.equal(process.owner, "root");
+  assert.equal(process.attributionSource, "pid");
+});
+
+test("does not guess from ambiguous user mounts when the container cwd is hidden", () => {
+  const command = "/opt/conda/envs/train/bin/python train.py";
+  const output = [
+    "__WATCH4GPU_HOST__",
+    "gpu-host",
+    "__WATCH4GPU_GPUS__",
+    "0, NVIDIA A100, GPU-0, 42, 80, 4096, 81920, 200, 400",
+    "__WATCH4GPU_PROCESSES__",
+    "GPU-0, 8001, /opt/conda/envs/train/bin/python, 2048",
+    "__WATCH4GPU_OWNERS__",
+    `root 8001 00:10:00 ${command}`,
+    "__WATCH4GPU_WORKLOADS__",
+    `root\t8001\t1\t8001\t8001\t00:10:00\t\t\t0\t0\t0\t1\t${command}`,
+    "__WATCH4GPU_MOUNTS__",
+    "8001\t/workspace/project-a\t/\tserver:/public/alice/project-a",
+    "8001\t/workspace/project-b\t/\tserver:/public/bob/project-b",
+    "__WATCH4GPU_NAMESPACES__",
+    "__WATCH4GPU_DEVICES__",
+    "__WATCH4GPU_DEVICE_PROCESSES__",
+    "__WATCH4GPU_DONE__",
+    "",
+  ].join("\n");
+
+  const process = parseProbe(output).gpus[0].processes[0];
+  assert.equal(process.attributedUser, "root");
+  assert.equal(process.attributionEvidence.taskUser, null);
+});
+
+test("uses the deepest mount covering a visible container cwd", () => {
+  const command = "/opt/conda/envs/train/bin/python train.py";
+  const output = [
+    "__WATCH4GPU_HOST__",
+    "gpu-host",
+    "__WATCH4GPU_GPUS__",
+    "0, NVIDIA A100, GPU-0, 42, 80, 4096, 81920, 200, 400",
+    "__WATCH4GPU_PROCESSES__",
+    "GPU-0, 8002, /opt/conda/envs/train/bin/python, 2048",
+    "__WATCH4GPU_OWNERS__",
+    `root 8002 00:10:00 ${command}`,
+    "__WATCH4GPU_WORKLOADS__",
+    `root\t8002\t1\t8002\t8002\t00:10:00\t\t/workspace/project-b/run\t0\t0\t0\t1\t${command}`,
+    "__WATCH4GPU_MOUNTS__",
+    "8002\t/workspace/project-a\t/\tserver:/public/alice/project-a",
+    "8002\t/workspace/project-b\t/\tserver:/public/bob/project-b",
+    "__WATCH4GPU_NAMESPACES__",
+    "__WATCH4GPU_DEVICES__",
+    "__WATCH4GPU_DEVICE_PROCESSES__",
+    "__WATCH4GPU_DONE__",
+    "",
+  ].join("\n");
+
+  const process = parseProbe(output).gpus[0].processes[0];
+  assert.equal(process.attributedUser, "bob");
+  assert.deepEqual(process.attributionEvidence.taskSources, ["mount"]);
+});
+
 test("attributes renamed vLLM GPU workers through their process group", () => {
-  const launchCommand = "/usr/bin/python3 /usr/local/bin/vllm serve /9950backfile/task_owner/models/example --tensor-parallel-size 2";
+  const launchCommand = "/usr/bin/python3 /usr/local/bin/vllm serve /shared/users/task_owner/models/example --tensor-parallel-size 2";
   const unrelatedCommand = "/usr/bin/python3 /usr/local/bin/vllm serve /public/other_owner/models/example --tensor-parallel-size 2";
   const output = [
     "__WATCH4GPU_HOST__",
@@ -192,7 +343,7 @@ test("attributes renamed vLLM GPU workers through their process group", () => {
     "root 9464 01:53:26 VLLM::Worker_TP0",
     "root 9465 01:53:26 VLLM::Worker_TP1",
     "__WATCH4GPU_WORKLOADS__",
-    `root\t8984\t22436\t8984\t22436\t01:53:50\t\t/9950backfile/task_owner/project\t0,1\t-\t-\t-\t${launchCommand}`,
+    `root\t8984\t22436\t8984\t22436\t01:53:50\t\t/shared/users/task_owner/project\t0,1\t-\t-\t-\t${launchCommand}`,
     `root\t7000\t1\t7000\t7000\t00:20:00\t\t/public/other_owner/project\t0,1\t-\t-\t-\t${unrelatedCommand}`,
     "__WATCH4GPU_NAMESPACES__",
     "__WATCH4GPU_DEVICES__",
@@ -216,7 +367,7 @@ test("attributes renamed vLLM GPU workers through their process group", () => {
 
 test("uses GPU-scoped weak evidence instead of another user's node-wide fallback", () => {
   const environmentCommand = "/public/environment_owner/envs/train/bin/python -u train.py";
-  const taskCommand = "/public/shared_env/envs/train/bin/python -u train.py --output /9950backfile/task_owner/outputs";
+  const taskCommand = "/public/shared_env/envs/train/bin/python -u train.py --output /shared/users/task_owner/outputs";
   const output = [
     "__WATCH4GPU_HOST__",
     "gpu-host",
@@ -330,10 +481,10 @@ test("does not guess a task user when identical container commands have differen
   assert.equal(process.attributionEvidence.conflict, false);
 });
 
-test("treats 9950backfile as a path root instead of a username", () => {
+test("treats shared/users as a path root instead of a username", () => {
   const command = [
     "/public/example_user/envs/train/bin/python train.py",
-    "--output /public/9950backfile/example_user/project/outputs",
+    "--output /public/shared/users/example_user/project/outputs",
   ].join(" ");
   const output = [
     "__WATCH4GPU_HOST__",
@@ -344,7 +495,7 @@ test("treats 9950backfile as a path root instead of a username", () => {
     "GPU-0, 7001, /public/example_user/envs/train/bin/python, 2048",
     "__WATCH4GPU_OWNERS__",
     "__WATCH4GPU_WORKLOADS__",
-    `root\t7001\t1\t7001\t7001\t00:10:00\t\t/9950backfile/example_user/project\t0\t0\t0\t1\t${command}`,
+    `root\t7001\t1\t7001\t7001\t00:10:00\t\t/shared/users/example_user/project\t0\t0\t0\t1\t${command}`,
     "__WATCH4GPU_NAMESPACES__",
     "__WATCH4GPU_DEVICES__",
     "__WATCH4GPU_DEVICE_PROCESSES__",

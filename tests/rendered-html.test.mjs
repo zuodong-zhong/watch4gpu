@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 import test from "node:test";
-
-const REPOSITORY_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -28,6 +24,8 @@ test("server-renders the real GPU dashboard shell", async () => {
   assert.match(html, /资源状态/);
   assert.match(html, /aria-label="搜索节点"/);
   assert.match(html, /aria-label="集群资源概览"/);
+  assert.match(html, /按用户筛选：全部用户/);
+  assert.match(html, /我的 GPU/);
   assert.match(html, /正在连接本地采集服务/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|GPU OPERATIONS|LOCAL CONTROL ROOM/);
 });
@@ -36,7 +34,8 @@ test("keeps resource totals mutually exclusive and error states honest", async (
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(page, /occupiedGpuTotal\s*=\s*allGpus\.length\s*-\s*freeGpuTotal/);
   assert.match(page, /serviceError\s*&&\s*nodes\.length\s*===\s*0/);
-  assert.match(page, /!serviceError\s*&&\s*filteredNodes\.length\s*===\s*0/);
+  assert.match(page, /!serviceError\s*&&\s*!selectedUser\s*&&\s*filteredNodes\.length\s*===\s*0/);
+  assert.match(page, /!serviceError\s*&&\s*selectedUser\s*&&\s*rankedNodes\.length\s*===\s*0/);
   assert.match(page, /上限未知/);
   assert.doesNotMatch(page, /busyCount|window\.confirm/);
 });
@@ -51,6 +50,11 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   assert.match(page, /event\.key === "Escape"/);
   assert.match(page, /TIMEOUT_STORAGE_KEY/);
   assert.match(page, /REFRESH_OPTIONS/);
+  assert.match(page, /buildUserGpuFilterOptions/);
+  assert.match(page, /selectedUserId/);
+  assert.match(page, /!selectedUser \|\| visibleGpus\.length > 0/);
+  assert.match(page, /visibleGpus\.map\(\(gpu\) => <GpuTile/);
+  assert.match(page, /显示全部用户/);
   assert.match(page, /new URLSearchParams\(\{ timeoutSeconds:/);
   assert.match(page, /aria-haspopup="dialog"/);
   assert.match(page, /暂停后仍可使用顶部按钮手动刷新/);
@@ -65,11 +69,12 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   assert.match(page, /可能是 @\$\{display\}/);
   assert.match(page, /系统账户 \$\{evidence\.systemAccount\}/);
   assert.match(page, /环境 \$\{evidence\.environmentUser\}/);
-  assert.match(page, /任务目录 \$\{evidence\.taskUser\}/);
+  assert.match(page, /\$\{taskEvidenceLabel\(evidence\)\} \$\{evidence\.taskUser\}/);
+  assert.match(page, /"挂载源"/);
   assert.match(page, /className="attribution-evidence"/);
   assert.match(page, /label: "系统账户"/);
   assert.match(page, /label: "环境"/);
-  assert.match(page, /label: "任务目录"/);
+  assert.match(page, /label: taskEvidenceLabel\(evidence\)/);
   assert.match(page, /<MetricRing value=\{gpu\.utilization\} label="利用率" \/>/);
   assert.match(page, /<MetricRing value=\{memoryPercent\} label="显存" \/>/);
   assert.doesNotMatch(page, /metric-pointer/);
@@ -82,6 +87,9 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   assert.match(css, /\.attribution-evidence \{/);
   assert.match(css, /\.modal-head > button \{[\s\S]*?width: 44px;[\s\S]*?height: 44px;/);
   assert.match(css, /\.collection-popover \{/);
+  assert.match(css, /\.user-filter-trigger \{/);
+  assert.match(css, /\.user-filter-popover \{/);
+  assert.match(css, /\.user-filter-options button\.active \{/);
   assert.match(css, /\.collection-options button\.active \{/);
   assert.doesNotMatch(css, /\.top-actions select\s*\{\s*display:\s*none/);
   assert.doesNotMatch(css, /\.top-actions \.primary::after/);
@@ -91,9 +99,9 @@ test("protects keyboard, mobile, and local development behavior", async () => {
 });
 
 test("keeps the public defaults free of private cluster configuration", async () => {
-  const nodesText = execFileSync("git", ["show", "HEAD:data/nodes.json"], { cwd: REPOSITORY_ROOT, encoding: "utf8" });
-  const namesText = execFileSync("git", ["show", "HEAD:data/user-names.json"], { cwd: REPOSITORY_ROOT, encoding: "utf8" });
-  const [page, server, readme, login] = await Promise.all([
+  const [nodesText, namesText, page, server, readme, login] = await Promise.all([
+    readFile(new URL("../data/nodes.json", import.meta.url), "utf8"),
+    readFile(new URL("../data/user-names.json", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../README.md", import.meta.url), "utf8"),

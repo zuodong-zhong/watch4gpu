@@ -7,11 +7,14 @@ if [[ $# -ne 1 || ! "$1" =~ ^[0-9]+$ ]]; then
 fi
 
 gpu_node_id="$1"
-expect_script="${WATCH4GPU_EXPECT_SCRIPT:-$HOME/connect.exp}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Prefer the explicitly configured path, then the script's own directory.  The
+# gateway account's HOME is not necessarily the directory containing login.sh.
+expect_script="${WATCH4GPU_EXPECT_SCRIPT:-$script_dir/connect.exp}"
 
 if [[ ! -f "$expect_script" ]]; then
   echo "Expect script not found: $expect_script" >&2
-  echo "Set WATCH4GPU_EXPECT_SCRIPT or create ~/connect.exp on the gateway." >&2
+  echo "Set WATCH4GPU_EXPECT_SCRIPT or place connect.exp beside login.sh on the gateway." >&2
   exit 1
 fi
 
