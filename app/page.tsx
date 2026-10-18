@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import userNames from "@/data/user-names.json";
 import { createNodePoller } from "@/lib/node-poller.mjs";
+import { isCurrentStatus, mergeNodeStatus } from "@/lib/node-status.mjs";
 import ThemeToggle from "./theme-toggle";
 import MyGpus from "./my-gpus";
 
@@ -42,6 +43,9 @@ type ProcessInfo = {
   attributionSource: AttributionSource;
   attributionEvidence?: AttributionEvidence | null;
   elapsed: string | null;
+  startedAt?: string | null;
+  elapsedSeconds?: number | null;
+  timingSource?: "process" | "estimated" | "related" | null;
   command: string | null;
   cwd?: string | null;
   containerPid: number | null;
@@ -87,6 +91,7 @@ type NodeStatus = {
   checkedAt: string;
   latencyMs: number;
   refreshFailed?: boolean;
+  partial?: boolean;
   hostname?: string;
   gpus: GpuInfo[];
   workloads?: WorkloadInfo[];
@@ -112,14 +117,15 @@ const USER_NAMES: Record<string, string> = (() => {
     return userNames;
   }
 })();
-const DEFAULT_TIMEOUT_SECONDS = 45;
+const DEFAULT_TIMEOUT_SECONDS = 90;
 const TIMEOUT_STORAGE_KEY = "watch4gpu.timeoutSeconds";
 const TIMEOUT_OPTIONS = [
   { seconds: 15, label: "快速" },
   { seconds: 25, label: "标准" },
   { seconds: 45, label: "稳妥" },
   { seconds: 60, label: "宽松" },
-  { seconds: 90, label: "最长" },
+  { seconds: 90, label: "推荐中转" },
+  { seconds: 120, label: "最长" },
 ];
 const REFRESH_OPTIONS = [
   { seconds: 10, label: "频繁" },
@@ -284,7 +290,7 @@ function MetricRing({ value, label }: { value: number; label: string }) {
   );
 }
 
-function GpuTile({ gpu }: { gpu: GpuInfo }) {
+function GpuTile({ gpu, historical = false }: { gpu: GpuInfo; historical?: boolean }) {
   const memoryPercent = gpu.memoryTotal ? (gpu.memoryUsed / gpu.memoryTotal) * 100 : 0;
   const free = isFreeGpu(gpu);
   return (
@@ -292,7 +298,7 @@ function GpuTile({ gpu }: { gpu: GpuInfo }) {
       <div className="gpu-head">
         <div><span className="gpu-index">GPU {gpu.index}</span><h4 title={gpu.name}>{gpu.name}</h4></div>
         <div className="gpu-state-group">
-          <span className={`gpu-state ${free ? "free" : "occupied"}`}>{free ? "可用" : "已占用"}</span>
+          <span className={`gpu-state ${free ? "free" : "occupied"}`}>{historical ? "上次" : ""}{free ? "可用" : "已占用"}</span>
           <span className={`temperature ${gpu.temperature >= 80 ? "hot" : ""}`}>{gpu.temperature}°C</span>
         </div>
       </div>
@@ -620,16 +626,16 @@ export default function Home() {
         return status;
       },
       onResult: (node, status) => {
-        setStatuses((current) => ({ ...current, [node.id]: status }));
+        setStatuses((current) => ({ ...current, [node.id]: mergeNodeStatus(current[node.id], status) }));
         failedRequestsRef.current.delete(node.id);
         setStatusError(failedRequestsRef.current.size ? "部分节点暂时无法刷新" : "");
         setNow(Date.now());
       },
       onError: (node) => {
         failedRequestsRef.current.add(node.id);
-        setStatuses((current) => current[node.id]?.ok ? ({ ...current, [node.id]: { ...current[node.id], refreshFailed: true } }) : ({
+        setStatuses((current) => ({
           ...current,
-          [node.id]: { nodeId: node.id, ok: false, checkedAt: new Date().toISOString(), latencyMs: 0, gpus: [], error: "暂时无法从本地采集服务获取此节点的数据" },
+          [node.id]: mergeNodeStatus(current[node.id], { nodeId: node.id, ok: false, checkedAt: new Date().toISOString(), latencyMs: 0, gpus: [], error: "暂时无法从本地采集服务获取此节点的数据" }),
         }));
         setStatusError("部分节点暂时无法刷新");
       },
@@ -694,8 +700,10 @@ export default function Home() {
   }, [nodes, query]);
 
   const enabledNodes = useMemo(() => nodes.filter((node) => node.enabled), [nodes]);
-  const allGpus = useMemo(() => enabledNodes.flatMap((node) => statuses[node.id]?.ok ? statuses[node.id].gpus : []), [enabledNodes, statuses]);
-  const userFilterOptions = useMemo(() => buildUserGpuFilterOptions(allGpus), [allGpus]);
+  const staleAfter = intervalSeconds ? Math.max(75_000, (intervalSeconds + timeoutSeconds + 10) * 1000) : 180_000;
+  const knownGpus = useMemo(() => enabledNodes.flatMap((node) => statuses[node.id]?.ok ? statuses[node.id].gpus : []), [enabledNodes, statuses]);
+  const allGpus = useMemo(() => enabledNodes.flatMap((node) => isCurrentStatus(statuses[node.id], now, staleAfter) ? statuses[node.id].gpus : []), [enabledNodes, statuses, now, staleAfter]);
+  const userFilterOptions = useMemo(() => buildUserGpuFilterOptions(knownGpus), [knownGpus]);
   const selectedUser = useMemo(() => userFilterOptions.find((option) => option.id === selectedUserId), [selectedUserId, userFilterOptions]);
   const selectedAccounts = useMemo(() => new Set(selectedUser?.accounts || []), [selectedUser]);
   const rankedNodes = useMemo(() => filteredNodes.map((node) => {
@@ -703,13 +711,13 @@ export default function Home() {
     const allNodeGpus = status?.ok ? status.gpus : [];
     const visibleGpus = selectedUser ? allNodeGpus.filter((gpu) => gpuMatchesAccounts(gpu, selectedAccounts)) : allNodeGpus;
     const visibleWorkloads = selectedUser ? (status?.workloads || []).filter((workload) => workloadMatchesAccounts(workload, selectedAccounts)) : status?.workloads || [];
-    const freeGpuCount = visibleGpus.filter(isFreeGpu).length;
+    const freeGpuCount = isCurrentStatus(status, now, staleAfter) ? visibleGpus.filter(isFreeGpu).length : 0;
     return { node, originalIndex: nodes.indexOf(node), freeGpuCount, visibleGpus, visibleWorkloads };
   }).filter(({ visibleGpus }) => !selectedUser || visibleGpus.length > 0)
     .sort((a, b) => selectedUser
       ? b.visibleGpus.length - a.visibleGpus.length || a.originalIndex - b.originalIndex
-      : b.freeGpuCount - a.freeGpuCount || a.originalIndex - b.originalIndex), [filteredNodes, nodes, selectedAccounts, selectedUser, statuses]);
-  const onlineCount = enabledNodes.filter((node) => statuses[node.id]?.ok).length;
+      : b.freeGpuCount - a.freeGpuCount || a.originalIndex - b.originalIndex), [filteredNodes, nodes, selectedAccounts, selectedUser, statuses, now, staleAfter]);
+  const onlineCount = enabledNodes.filter((node) => isCurrentStatus(statuses[node.id], now, staleAfter)).length;
   const freeGpuTotal = allGpus.filter(isFreeGpu).length;
   const occupiedGpuTotal = allGpus.length - freeGpuTotal;
   const visibleGpuTotal = rankedNodes.reduce((total, node) => total + node.visibleGpus.length, 0);
@@ -793,8 +801,9 @@ export default function Home() {
     if (!node.enabled) return { label: "已停用", tone: "disabled" };
     if (!status) return { label: "正在连接", tone: "connecting" };
     if (!status.ok) return { label: "无法连接", tone: "error" };
-    const staleAfter = intervalSeconds ? Math.max(75_000, (intervalSeconds + timeoutSeconds + 10) * 1000) : 180_000;
-    if (now - new Date(status.checkedAt).getTime() > staleAfter) return { label: "数据已过期", tone: "stale" };
+    if (status.refreshFailed) return { label: "刷新失败 · 上次记录", tone: "stale" };
+    if (status.partial) return { label: "部分数据 · 待重试", tone: "stale" };
+    if (!isCurrentStatus(status, now, staleAfter)) return { label: "数据已过期", tone: "stale" };
     return { label: "在线", tone: "online" };
   }
 
@@ -824,13 +833,13 @@ export default function Home() {
         </div>
         <div className="collection-controls" aria-label="采集设置">
           <CollectionPicker id="refresh-menu" label="刷新间隔" value={intervalSeconds} options={REFRESH_OPTIONS} icon="refresh" helperText="各节点独立刷新，采集结束后再等待所选时间。暂停后仍可使用顶部按钮手动刷新。" onChange={chooseInterval} />
-          <CollectionPicker id="timeout-menu" label="超时上限" value={timeoutSeconds} options={TIMEOUT_OPTIONS} icon="timeout" helperText="较慢的中转节点建议选择 45 秒以上。" disabled={!settingsReady} onChange={chooseTimeout} />
+          <CollectionPicker id="timeout-menu" label="超时上限" value={timeoutSeconds} options={TIMEOUT_OPTIONS} icon="timeout" helperText="中转节点建议选择 90 秒，连接较慢时可用 120 秒。" disabled={!settingsReady} onChange={chooseTimeout} />
         </div>
       </section>
 
       {serviceError && nodes.length > 0 && <div className="notice" role="alert"><span aria-hidden="true">!</span><div><strong>暂时无法刷新</strong><p>继续显示上次成功采集的数据。</p></div><button onClick={() => { void loadNodes(); void refresh(); }}>重试</button></div>}
 
-      <MyGpus nodes={nodes} statuses={statuses} names={USER_NAMES} api={API} now={now} staleAfter={intervalSeconds ? Math.max(75_000, (intervalSeconds + timeoutSeconds + 10) * 1000) : 180_000} />
+      <MyGpus nodes={nodes} statuses={statuses} names={USER_NAMES} api={API} now={now} staleAfter={staleAfter} />
 
       <section className="section-head" aria-labelledby="nodes-heading">
         <div className="section-heading">
@@ -840,7 +849,7 @@ export default function Home() {
           </div>
         </div>
         <div className="section-tools">
-          <UserFilter options={userFilterOptions} value={selectedUserId} allGpuCount={allGpus.length} onChange={setSelectedUserId} />
+          <UserFilter options={userFilterOptions} value={selectedUserId} allGpuCount={knownGpus.length} onChange={setSelectedUserId} />
           <div className={`availability-status ${freeGpuTotal ? "available" : allGpus.length ? "busy" : "pending"}`}>
             <span className="availability-dot" aria-hidden="true" />
             <span>{freeGpuTotal ? `${freeGpuTotal} 块 GPU 可立即使用` : allGpus.length ? "暂无空闲 GPU" : "等待资源数据"}</span>
@@ -860,6 +869,7 @@ export default function Home() {
         {rankedNodes.map(({ node, originalIndex, freeGpuCount, visibleGpus, visibleWorkloads }) => {
           const status = statuses[node.id];
           const state = nodeState(node, status);
+          const partial = Boolean(status?.partial && !status.refreshFailed);
           return (
             <article className={`node-card ${freeGpuCount > 0 ? "has-free" : ""} state-${state.tone}`} key={node.id}>
               <div className="node-header">
@@ -868,12 +878,13 @@ export default function Home() {
               </div>
 
               {!node.enabled ? <div className="state-message"><strong>这个节点已停用</strong><p>编辑节点可重新启用自动采集。</p></div> : status?.ok ? <>
+                {state.tone === "stale" && <div className="node-refresh-warning" role="status"><div><strong>{partial ? "已显示本次采集到的 GPU 数据" : "保留上次采集的数据"}</strong><p>{status.error || "数据已过期，等待重新采集。"}</p><p>{partial ? "本次详情采集尚未完成，暂不计入当前可用资源。" : "以下为历史快照，不计入当前可用资源。"}</p></div><button onClick={() => void refresh(node.id)}>重新尝试</button></div>}
                 <div className="node-summary">
-                  <div>{selectedUser ? <><strong>{visibleGpus.length}</strong><span>块 {selectedUser.label} 的 GPU</span></> : <><strong>{freeGpuCount}</strong><span>/ {visibleGpus.length} 块可用</span></>}</div>
+                  <div>{state.tone === "stale" ? <><strong>{visibleGpus.length}</strong><span>块 GPU · {partial ? "部分数据" : "上次记录"}</span></> : selectedUser ? <><strong>{visibleGpus.length}</strong><span>块 {selectedUser.label} 的 GPU</span></> : <><strong>{freeGpuCount}</strong><span>/ {visibleGpus.length} 块可用</span></>}</div>
                   <p><span>{status.latencyMs} ms</span><span>{status.hostname || node.name}</span><span>{relativeTime(status.checkedAt, now)}更新</span></p>
                 </div>
                 <WorkloadDetails workloads={visibleWorkloads} />
-                <div className="gpu-grid">{visibleGpus.map((gpu) => <GpuTile gpu={gpu} key={gpu.uuid || gpu.index} />)}</div>
+                <div className="gpu-grid">{visibleGpus.map((gpu) => <GpuTile gpu={gpu} historical={state.tone === "stale"} key={gpu.uuid || gpu.index} />)}</div>
               </> : status ? <div className="state-message error"><strong>无法连接节点</strong><p>{status.error}</p><button onClick={() => void refresh(node.id)}>重新尝试</button></div> : <div className="state-message"><strong>正在建立连接</strong><p>首次采集可能需要几秒钟。</p></div>}
 
               {deleteIndex === originalIndex && <div className="delete-confirm" role="alertdialog" aria-label={`确认删除 ${node.name}`}><p><strong>删除“{node.name}”？</strong><span>节点配置将从本机移除。</span></p><div><button onClick={() => setDeleteIndex(null)} disabled={deleting}>取消</button><button className="danger" onClick={() => void deleteNode(originalIndex)} disabled={deleting}>{deleting ? "正在删除…" : "确认删除"}</button></div></div>}

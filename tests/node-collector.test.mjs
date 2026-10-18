@@ -151,6 +151,32 @@ test("default and explicit shell transports share the same collection", async ()
   assert.equal(await explicit, "shared shell result");
 });
 
+test("a slow relay node does not hold back other nodes on the same gateway", async () => {
+  const calls = [];
+  const collect = createNodeCollector((node, timeoutMs) => {
+    const work = deferred();
+    calls.push({ node, timeoutMs, work });
+    return work.promise;
+  });
+  const nodes = Array.from({ length: 3 }, (_, i) => ({ ...relayNode, id: `relay-${i}`, gpuNodeId: String(i) }));
+  const requests = nodes.map((node) => collect(node, 45_000));
+  assert.equal(collect(nodes[0], 90_000), requests[0], "the same slow node still shares a single connection");
+  await nextTurn();
+  assert.deepEqual(calls.map(({ node }) => node.id), ["relay-0", "relay-1", "relay-2"]);
+  calls[1].work.resolve("fast result");
+  assert.equal(await requests[1], "fast result");
+  const refreshed = collect(nodes[1]);
+  await nextTurn();
+  assert.equal(calls[3].node.id, "relay-1");
+  calls[3].work.resolve("fresh result");
+  assert.equal(await refreshed, "fresh result");
+  const rejected = assert.rejects(requests[0], /gateway failure/);
+  calls[0].work.reject(new Error("gateway failure"));
+  await rejected;
+  calls[2].work.resolve("complete");
+  await requests[2];
+});
+
 class FakeChild extends EventEmitter {
   pid = 123;
   exitCode = null;

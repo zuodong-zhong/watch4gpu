@@ -4,6 +4,7 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import { relayRemoteProbeSteps, runRelay } from "../server.mjs";
+import { buildRelayLogin } from "../lib/relay-command.mjs";
 
 const relayNode = { gatewayHost: "gateway", gpuNodeId: "34", loginScript: "/shared/login_1.sh" };
 const shellReady = "[fake_cmd GPU34]$ pexpect --kill_disabled -- /bin/bash\r\nroot@gpu:/# ";
@@ -54,6 +55,9 @@ test("relay timeouts identify login progress without copying the transcript", as
   const cases = [
     ["", relayNode, "连接 SSH 网关"],
     ["SUDOPASS:private-session-detail\r\n", relayNode, "等待中转服务握手"],
+    ["SUDOPASS:\r\n", relayNode, "等待网关身份验证"],
+    ['spawn python -c print("__WATCH4GPU_CLIENT_STARTED__")\r\nSUDOPASS:\r\n', relayNode, "等待网关身份验证"],
+    ["SUDOPASS:\r\n__WATCH4GPU_CLIENT_STARTED__\r\n", relayNode, "等待中转服务握手"],
     ["[fake_cmd GPU34]$ ", relayNode, "等待交互终端启动"],
     ["[fake_cmd GPU34]$ pexpect --kill_disabled -- /bin/bash\r\n", relayNode, "等待节点 Shell"],
     ["root@gpu:/# conda activate /private-environment\r\n", { ...relayNode, loginScript: "/shared/login.sh" }, "等待 Conda 初始化"],
@@ -104,6 +108,18 @@ test("the same select failure is recognized on stderr", async () => {
   assert.match((await result).message, /select\(\) 文件描述符超出限制/);
 });
 
+test("a missing relay address fails promptly without exposing the login transcript", async () => {
+  const child = new FakeChild();
+  const result = runRelay(relayNode, 10_000, () => child).catch((error) => error);
+  child.stdout.write('private-session-detail\r\n[fake_cmd WARNING] - "client.py:682" - Server address not found: ./servers/private-channel.\r\n');
+  await child.killed;
+  assert.deepEqual(child.writes, []);
+  child.close();
+  const error = await result;
+  assert.match(error.message, /^中转地址不可用：未找到节点的服务监听标记/);
+  assert.doesNotMatch(error.message, /private-session-detail|private-channel/);
+});
+
 test("two relay sessions keep independent input and progress", async () => {
   const children = [new FakeChild(), new FakeChild()];
   const calls = [];
@@ -113,8 +129,8 @@ test("two relay sessions keep independent input and progress", async () => {
   };
   const first = runRelay(relayNode, 10_000, spawn);
   const second = runRelay({ ...relayNode, gpuNodeId: "46" }, 10_000, spawn);
-  assert.equal(calls[0].args.at(-1), "bash /shared/login_1.sh 34");
-  assert.equal(calls[1].args.at(-1), "bash /shared/login_1.sh 46");
+  assert.equal(calls[0].args.at(-1), buildRelayLogin(relayNode, 10_000));
+  assert.equal(calls[1].args.at(-1), buildRelayLogin({ ...relayNode, gpuNodeId: "46" }, 10_000));
 
   children[0].stdout.write(shellReady);
   assert.equal(children[0].writes.length, 1);

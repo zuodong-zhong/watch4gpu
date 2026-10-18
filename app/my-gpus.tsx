@@ -2,6 +2,10 @@
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { resolveMyAccounts, summarizeMyGpus, type MyNode, type MyStatus } from "@/lib/my-gpus.mjs";
+import { formatShanghaiTime } from "@/lib/task-time.mjs";
+import MyTasks from "./my-tasks";
+import NodeTaskSummary from "./node-task-summary";
+import { summarizeMyTasks, summarizeNodeTaskDescriptions } from "@/lib/my-tasks.mjs";
 
 const STORAGE_KEY = "watch4gpu.myAccounts";
 const COLLAPSED_STORAGE_KEY = "watch4gpu.myGpusCollapsed";
@@ -55,6 +59,8 @@ export default function MyGpus({ nodes, statuses, names, api, now, staleAfter }:
 
   const accounts = useMemo(() => resolveMyAccounts(identity, names), [identity, names]);
   const summary = useMemo(() => summarizeMyGpus(nodes, statuses, accounts, now, staleAfter), [nodes, statuses, accounts, now, staleAfter]);
+  const taskGroups = useMemo(() => summarizeMyTasks(nodes, statuses, accounts, now, staleAfter), [nodes, statuses, accounts, now, staleAfter]);
+  const nodeTaskDescriptions = useMemo(() => new Map(taskGroups.map(({ node, tasks }) => [node.id, summarizeNodeTaskDescriptions(tasks)])), [taskGroups]);
   const displayNames = [...new Set([...accounts].map((account) => names[account]?.trim() || `@${account}`))].join("、");
 
   function save(event: FormEvent) {
@@ -92,10 +98,18 @@ export default function MyGpus({ nodes, statuses, names, api, now, staleAfter }:
     </form>}
     {ready && accounts.size > 0 && <>
       {summary.groups.length > 0 ? <div className="my-gpus-nodes">{summary.groups.map(({ node, cards, stale, checkedAt }) => <div className={`my-gpus-node ${stale ? "is-stale" : ""}`} key={node.id}>
-        <div className="my-gpus-node-name"><strong>{node.name}</strong><small>{stale ? "上次记录 · 待刷新" : "最近采集"} · {new Date(checkedAt).toLocaleTimeString("zh-CN", { hour12: false })}</small></div>
-        <ul>{cards.map((card) => <li key={card.uuid || card.index} className={card.uncertain ? "uncertain" : ""} title={`${card.name} · ${card.processCount} 个匹配进程`}><strong>GPU {card.index}</strong><span>{card.name}</span>{card.uncertain ? <small>归属待确认</small> : card.inferred ? <small>推断</small> : null}</li>)}</ul>
+        <div className="my-gpus-node-heading"><strong>{node.name}</strong><small>{stale ? "上次记录 · 待刷新" : "最近采集"} · <time dateTime={checkedAt}>{formatShanghaiTime(checkedAt)}</time>（上海）</small></div>
+        <div className="my-gpus-node-name"><NodeTaskSummary summaries={nodeTaskDescriptions.get(node.id) || []} stale={stale} /></div>
+        <div className="my-gpus-card-groups" aria-label={`${node.name} 的 GPU`}>{[...new Set(cards.map((card) => card.name))].map((model) => {
+          const modelCards = cards.filter((card) => card.name === model);
+          return <div className="my-gpus-card-group" key={model}>
+            <div className="my-gpus-card-heading"><span>{model}</span><small>{modelCards.length} 块 GPU</small></div>
+            <ul>{modelCards.map((card) => <li key={card.uuid || card.index} className={card.uncertain ? "uncertain" : ""} title={`${card.name} · ${card.processCount} 个匹配进程`}><strong>GPU {card.index}</strong>{card.uncertain ? <small>归属待确认</small> : card.inferred ? <small>推断归属</small> : <small>已匹配</small>}</li>)}</ul>
+          </div>;
+        })}</div>
       </div>)}</div> : <p className="my-gpus-empty">{!nodes.some((node) => node.enabled) ? "添加或启用节点后，这里会显示你使用的 GPU。" : summary.unavailableNodes ? "等待节点数据，暂时无法确认你正在使用哪些卡。" : "最近采集中未发现这些账号的 GPU 进程。"}</p>}
       {(summary.unavailableNodes > 0 || summary.unknownGpus > 0) && <p className="my-gpus-note">{summary.unavailableNodes > 0 && `${summary.unavailableNodes} 个节点未就绪、刷新失败或数据过期，当前统计可能不完整。`}{summary.unknownGpus > 0 && ` ${summary.unknownGpus} 块 GPU 存在无法识别归属的进程。`}</p>}
+      <MyTasks groups={taskGroups} />
     </>}
     </div>
   </section>;

@@ -7,10 +7,45 @@ import { spawnSync } from "node:child_process";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { gunzipSync } from "node:zlib";
-import { buildRelayCommandLogin, buildRelayCommandProbe, relayCommandReadyMarker } from "../lib/relay-command.mjs";
+import { buildRelayLogin, buildRelayCommandLogin, buildRelayCommandProbe, relayCommandReadyMarker } from "../lib/relay-command.mjs";
 import { relayRemoteProbeSteps, runRelay } from "../server.mjs";
 
 const node = { id: "gpu-test", mode: "relay", gatewayHost: "gateway", gpuNodeId: "34", loginScript: "/shared/login_1.sh", relayTransport: "command" };
+
+test("a slow client survives the legacy startup deadline in both relay transports", async (t) => {
+  if (spawnSync("expect", ["-v"]).status !== 0) return t.skip("Expect is not installed");
+  const directory = await mkdtemp(join(tmpdir(), "watch4gpu-startup-"));
+  try {
+    const script = join(directory, "connect.exp");
+    const loginScript = join(directory, "login.sh");
+    await writeFile(script, String.raw`
+set prompt_timeout 1
+set timeout $prompt_timeout
+# A pipe models authentication finishing just after the old startup deadline.
+# This does not allocate a PTY or connect to a remote host.
+spawn -open [open {|/bin/sh -c {sleep 1.3; printf "CLIENT_READY\n"} 2>@1} r]
+expect {
+  "CLIENT_READY" { send_user "STARTUP_SUCCEEDED\n" }
+  timeout { exit 42 }
+  eof { exit 43 }
+}
+`);
+    await writeFile(loginScript, `expect ${script} "$1"\n`);
+    const original = spawnSync("bash", [loginScript, "34"], { encoding: "utf8", timeout: 5000 });
+    assert.equal(original.status, 42, original.stderr);
+    for (const relayTransport of ["shell", "command"]) {
+      const adapted = spawnSync("bash", ["-c", buildRelayLogin({ ...node, loginScript, relayTransport }, 3000)], { encoding: "utf8", timeout: 5000 });
+      assert.equal(adapted.status, 0, `${relayTransport}: ${adapted.stderr}`);
+      assert.match(adapted.stdout, /STARTUP_SUCCEEDED/);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("non-legacy shell scripts retain their entry point and quote login arguments", () => {
+  assert.equal(buildRelayLogin({ ...node, relayTransport: "shell", loginScript: "/shared/login_new_expect.sh", loginArg: "GPU_34" }, 90000), "bash /shared/login_new_expect.sh 'GPU_34'");
+});
 
 test("command transport carries the complete read-only probe below the terminal line limit", () => {
   const command = buildRelayCommandProbe(relayRemoteProbeSteps);

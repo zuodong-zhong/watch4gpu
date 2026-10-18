@@ -58,7 +58,7 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   assert.match(page, /new URLSearchParams\(\{ timeoutSeconds:/);
   assert.match(page, /aria-haspopup="dialog"/);
   assert.match(page, /暂停后仍可使用顶部按钮手动刷新/);
-  assert.match(page, /较慢的中转节点建议选择 45 秒以上/);
+  assert.match(page, /中转节点建议选择 90 秒/);
   assert.match(page, /focusableSelector/);
   assert.match(page, /previousFocusRef\.current\?\.focus/);
   assert.match(page, /aria-modal="true"/);

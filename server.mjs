@@ -1,12 +1,14 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { userInfo } from "node:os";
+import { parseElapsedSeconds, parseProcessTimes, toShanghaiTimestamp } from "./lib/task-time.mjs";
 import { readFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createNodeCollector } from "./node-collector.mjs";
-import { buildRelayCommandLogin, buildRelayCommandProbe, relayCommandReadyMarker } from "./lib/relay-command.mjs";
+import { sshOptions } from "./lib/ssh-options.mjs";
+import { buildRelayLogin, buildRelayCommandProbe, relayCommandReadyMarker, relayClientStartedMarker } from "./lib/relay-command.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_FILE = join(ROOT, "data", "nodes.json");
@@ -14,7 +16,7 @@ const CONFIG_FILE = process.env.WATCH4GPU_CONFIG_FILE || join(ROOT, "data", "nod
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.WATCH4GPU_API_PORT || 8787);
 const SSH_TIMEOUT_MS = Number(process.env.WATCH4GPU_SSH_TIMEOUT_MS || 25000);
-const RELAY_TIMEOUT_MS = Number(process.env.WATCH4GPU_RELAY_TIMEOUT_MS || 45000);
+const RELAY_TIMEOUT_MS = Number(process.env.WATCH4GPU_RELAY_TIMEOUT_MS || 90000);
 const CONTAINER_PROCESS_INSPECTION = !/^(?:0|false|off)$/i.test(process.env.WATCH4GPU_CONTAINER_PROCESS_INSPECTION || "1");
 const MIN_TIMEOUT_SECONDS = 5;
 const MAX_TIMEOUT_SECONDS = 120;
@@ -70,6 +72,8 @@ const configuredDeepInspectionUsers = [
 
 const gpuQuery = "nvidia-smi --query-gpu=index,name,uuid,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,power.limit --format=csv,noheader,nounits";
 const processQuery = "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true";
+const taskTimeMarker = "__WATCH4GPU_TASK_TIMES__";
+const taskTimeQuery = "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u | while IFS= read -r pid; do case \"$pid\" in ''|*[!0-9]*) continue;; esac; LC_ALL=C TZ=UTC ps -ww -p \"$pid\" -o pid= -o lstart= -o etimes= 2>/dev/null; done";
 const ownerQuery = "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | while IFS= read -r pid; do ps -ww -p \"$pid\" -o user= -o pid= -o etime= -o args= 2>/dev/null; done";
 const workloadProcessPattern = "[t]orchrun|[d]eepspeed|[a]ccelerate|[p]ython|[s]wift|[vV][lL][lL][mM]";
 const workloadQuery = [
@@ -145,7 +149,7 @@ const deviceQuery = [
   "done",
 ].join(" ");
 const remoteProbePrefix = `printf '__WATCH4GPU_HOST__\\n'; hostname; printf '__WATCH4GPU_GPUS__\\n'; ${gpuQuery}; printf '__WATCH4GPU_PROCESSES__\\n'; ${processQuery}; printf '__WATCH4GPU_OWNERS__\\n'; ${ownerQuery}; printf '__WATCH4GPU_WORKLOADS__\\n'; ${workloadQuery}; printf '${mountInfoMarker}\\n'; ${mountInfoQuery}; printf '__WATCH4GPU_NAMESPACES__\\n'; ${namespaceQuery}; printf '__WATCH4GPU_DEVICES__\\n'; ${deviceQuery}; printf '${containerCwdMarker}\\n'`;
-const remoteProbe = `${remoteProbePrefix}; ${CONTAINER_PROCESS_INSPECTION ? containerCwdQuery : ":"}; printf '__WATCH4GPU_DONE__\\n'`;
+const remoteProbe = `${remoteProbePrefix}; ${CONTAINER_PROCESS_INSPECTION ? containerCwdQuery : ":"}; printf '${taskTimeMarker}\\n'; ${taskTimeQuery}; printf '__WATCH4GPU_DONE__\\n'`;
 function relayMarkerPrint(marker) {
   const prefix = "__WATCH4GPU_";
   if (!marker.startsWith(prefix)) throw new Error(`无效的中转标记：${marker}`);
@@ -160,7 +164,8 @@ const relayRemoteProbeSteps = [
   { marker: "__WATCH4GPU_NAMESPACES__", stage: "读取进程挂载信息", command: `${mountInfoQuery}; ${relayMarkerPrint("__WATCH4GPU_NAMESPACES__")}` },
   { marker: "__WATCH4GPU_DEVICES__", stage: "读取进程命名空间", command: `${namespaceQuery}; ${relayMarkerPrint("__WATCH4GPU_DEVICES__")}` },
   { marker: containerCwdMarker, stage: "读取 GPU 设备占用", command: `${deviceQuery}; ${relayMarkerPrint(containerCwdMarker)}` },
-  { marker: "__WATCH4GPU_DONE__", stage: "完成采集", command: `:; ${relayMarkerPrint("__WATCH4GPU_DONE__")}` },
+  { marker: taskTimeMarker, stage: "读取任务时间", command: `:; ${relayMarkerPrint(taskTimeMarker)}` },
+  { marker: "__WATCH4GPU_DONE__", stage: "完成采集", command: `${taskTimeQuery}; ${relayMarkerPrint("__WATCH4GPU_DONE__")}` },
 ];
 const relayRemoteProbe = relayRemoteProbeSteps.map(({ command }) => command).join("\r");
 const relayCommandProbe = buildRelayCommandProbe(relayRemoteProbeSteps);
@@ -258,11 +263,16 @@ function run(command, args, input, timeoutMs = SSH_TIMEOUT_MS, spawnProcess = sp
       clearTimeout(timer);
       clearTimeout(killTimer);
       // Keep the collection locked until SSH has exited and closed its pipes.
-      if (failure) reject(failure);
+      if (failure) {
+        Object.defineProperty(failure, "probeOutput", { value: stdout });
+        reject(failure);
+      }
       else if (code === 0 && stdout.includes("__WATCH4GPU_DONE__")) resolve(stdout);
       else {
         const details = `${stdout}\n${stderr}`.trim() || `SSH 退出码 ${code}`;
-        reject(new Error(details.slice(-1800)));
+        const error = new Error(details.slice(-1800));
+        Object.defineProperty(error, "probeOutput", { value: stdout });
+        reject(error);
       }
     });
     if (input) {
@@ -307,15 +317,16 @@ function relayLoginStage(output) {
   if (/conda activate/.test(clean)) return "等待 Conda 初始化";
   if (/pexpect\s+[^\n]*\/bin\/bash/.test(clean)) return "等待节点 Shell";
   if (/\[fake_cmd[^\]]*\]\$/.test(clean)) return "等待交互终端启动";
+  if (clean.split("\n").includes(relayClientStartedMarker)) return "等待中转服务握手";
+  if (/(?:^|\n)SUDOPASS:\s*(?:\n|$)/.test(clean)) return "等待网关身份验证";
   return clean.trim() ? "等待中转服务握手" : "连接 SSH 网关";
 }
 
 function runRelay(node, timeoutMs = RELAY_TIMEOUT_MS, spawnProcess = spawn) {
   return new Promise((resolve, reject) => {
-    const loginArg = node.loginArg || node.gpuNodeId;
     const commandMode = node.relayTransport === "command";
-    const loginCommand = commandMode ? buildRelayCommandLogin(node) : `bash ${node.loginScript} ${loginArg}`;
-    const args = ["-tt", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", node.gatewayHost, loginCommand];
+    const loginCommand = buildRelayLogin(node, timeoutMs);
+    const args = [...sshOptions(timeoutMs, true), node.gatewayHost, loginCommand];
     const child = spawnProcess("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -339,6 +350,10 @@ function runRelay(node, timeoutMs = RELAY_TIMEOUT_MS, spawnProcess = spawn) {
     const failForStartupError = () => {
       if (outcome || sentProbe) return false;
       const clean = stripTerminalCodes(`${stdout}\n${stderr}`);
+      if (/\[fake_cmd WARNING\][^\n]*Server address not found:/.test(clean)) {
+        finish(new Error("中转地址不可用：未找到节点的服务监听标记，请检查登录参数或节点服务状态"));
+        return true;
+      }
       if (!/Command terminated with exception:\s*<class ['"]ValueError['"]>\s*-\s*filedescriptor out of range in select\(\)/.test(clean)) return false;
       finish(new Error("中转交互终端启动失败：服务器 select() 文件描述符超出限制，无法创建节点 Shell"));
       return true;
@@ -393,7 +408,10 @@ function runRelay(node, timeoutMs = RELAY_TIMEOUT_MS, spawnProcess = spawn) {
         const details = stripTerminalCodes(`${stdout}\n${stderr}`).trim() || `SSH 退出码 ${code}`;
         outcome = { error: new Error(details.slice(-1800)) };
       }
-      if (outcome.error) reject(outcome.error); else resolve(outcome.value);
+      if (outcome.error) {
+        Object.defineProperty(outcome.error, "probeOutput", { value: stripTerminalCodes(stdout) });
+        reject(outcome.error);
+      } else resolve(outcome.value);
     });
   });
 }
@@ -548,7 +566,7 @@ function selectUnambiguousWorkload(candidates, { requireTaskEvidence = false } =
   return usable.find((candidate) => candidate.command) || usable[0];
 }
 
-function parseProbe(output) {
+function parseProbe(output, checkedAt = new Date().toISOString()) {
   const hostMarker = "__WATCH4GPU_HOST__";
   const gpuMarker = "__WATCH4GPU_GPUS__";
   const processMarker = "__WATCH4GPU_PROCESSES__";
@@ -569,6 +587,7 @@ function parseProbe(output) {
   const deviceStart = output.lastIndexOf(deviceMarker);
   const containerStart = output.lastIndexOf(containerMarker);
   const doneStart = output.lastIndexOf(doneMarker);
+  const taskTimeStart = output.lastIndexOf(taskTimeMarker);
   const hostPart = hostStart >= 0 && gpuStart > hostStart ? output.slice(hostStart + hostMarker.length, gpuStart) : "";
   const gpuPart = gpuStart >= 0 && processStart > gpuStart ? output.slice(gpuStart + gpuMarker.length, processStart) : "";
   const processPart = processStart >= 0 && ownerStart > processStart ? output.slice(processStart + processMarker.length, ownerStart) : "";
@@ -577,9 +596,11 @@ function parseProbe(output) {
   const workloadPart = workloadStart >= 0 && workloadEnd > workloadStart ? output.slice(workloadStart + workloadMarker.length, workloadEnd) : "";
   const mountPart = mountStart >= 0 && namespaceStart > mountStart ? output.slice(mountStart + mountMarker.length, namespaceStart) : "";
   const namespacePart = namespaceStart >= 0 && deviceStart > namespaceStart ? output.slice(namespaceStart + namespaceMarker.length, deviceStart) : "";
-  const deviceEnd = containerStart > deviceStart ? containerStart : doneStart;
+  const deviceEnd = containerStart > deviceStart ? containerStart : taskTimeStart > deviceStart ? taskTimeStart : doneStart;
   const devicePart = deviceStart >= 0 && deviceEnd > deviceStart ? output.slice(deviceStart + deviceMarker.length, deviceEnd) : "";
-  const containerPart = containerStart >= 0 && doneStart > containerStart ? output.slice(containerStart + containerMarker.length, doneStart) : "";
+  const containerEnd = taskTimeStart > containerStart ? taskTimeStart : doneStart;
+  const containerPart = containerStart >= 0 && containerEnd > containerStart ? output.slice(containerStart + containerMarker.length, containerEnd) : "";
+  const processTimes = parseProcessTimes(taskTimeStart >= 0 && doneStart > taskTimeStart ? output.slice(taskTimeStart + taskTimeMarker.length, doneStart) : "");
   const deviceProcessStart = devicePart.indexOf(deviceProcessMarker);
   const deviceMapPart = deviceProcessStart >= 0 ? devicePart.slice(0, deviceProcessStart) : "";
   const deviceProcessPart = deviceProcessStart >= 0 ? devicePart.slice(deviceProcessStart + deviceProcessMarker.length) : "";
@@ -878,7 +899,14 @@ function parseProbe(output) {
       owner = directOwner;
       mappingSource = "pid";
     }
-    const launchCommand = workload?.command || directDeviceProcess?.command || owner?.command || null;
+    let launchCommand = workload?.command || directDeviceProcess?.command || owner?.command || null;
+    // ps may have the complete command while a linked workload probe capped it.
+    // Extend only an exact prefix, never replace a related task with an unrelated worker.
+    if (launchCommand) {
+      for (const candidate of [directOwner?.command, directDeviceProcess?.command, owner?.command]) {
+        if (candidate?.startsWith(launchCommand) && candidate.length > launchCommand.length) launchCommand = candidate;
+      }
+    }
     const linkedAttribution = workload?.attributionEvidence || owner?.attributionEvidence
       ? {
           attributedUser: workload?.attributedUser || owner?.attributedUser || null,
@@ -892,6 +920,13 @@ function parseProbe(output) {
         });
     const attributedUser = linkedAttribution.attributedUser;
     const attributionSource = mappingSource || (attributedUser ? "path" : null);
+    const directElapsed = directOwner?.elapsed || directDeviceProcess?.elapsed || directWorkload?.elapsed || namespaceWorkload?.elapsed;
+    const elapsedSeconds = parseElapsedSeconds(directElapsed || owner?.elapsed);
+    const timing = processTimes.get(numericPid) || {
+      startedAt: elapsedSeconds == null ? null : toShanghaiTimestamp(Date.parse(checkedAt) - elapsedSeconds * 1000),
+      elapsedSeconds,
+      timingSource: elapsedSeconds == null ? null : directElapsed ? "estimated" : "related",
+    };
     return {
       gpuUuid,
       pid: numericPid,
@@ -902,6 +937,8 @@ function parseProbe(output) {
       attributionSource,
       attributionEvidence: linkedAttribution.attributionEvidence || null,
       elapsed: owner?.elapsed || null,
+      ...timing,
+      timeZone: "Asia/Shanghai",
       command: launchCommand,
       containerPid: workload?.pid || null,
       ppid: workload?.ppid || null,
@@ -914,20 +951,66 @@ function parseProbe(output) {
   return { hostname: hostPart.trim().split(/\r?\n/).filter(Boolean).at(-1), gpus, workloads };
 }
 
+function parseIncompleteProbe(output, checkedAt) {
+  if (typeof output !== "string") return null;
+  const sections = [
+    ["__WATCH4GPU_HOST__", "读取节点名称"],
+    ["__WATCH4GPU_GPUS__", "读取 GPU 状态"],
+    ["__WATCH4GPU_PROCESSES__", "读取 GPU 进程"],
+    ["__WATCH4GPU_OWNERS__", "读取进程归属"],
+    ["__WATCH4GPU_WORKLOADS__", "读取训练进程"],
+    [mountInfoMarker, "读取进程挂载信息"],
+    ["__WATCH4GPU_NAMESPACES__", "读取进程命名空间"],
+    ["__WATCH4GPU_DEVICES__", "读取 GPU 设备占用"],
+    [containerCwdMarker, "读取容器详情"],
+    [taskTimeMarker, "读取任务时间"],
+    ["__WATCH4GPU_DONE__", "结束连接"],
+  ];
+  let lastSection = -1;
+  let boundary = -1;
+  for (const [index, [marker]] of sections.entries()) {
+    const at = output.lastIndexOf(marker);
+    if (at <= boundary) break;
+    lastSection = index;
+    boundary = at;
+  }
+  // Both the GPU list and compute-process list must be complete. In particular,
+  // never turn a truncated process list into an apparently idle GPU.
+  if (lastSection < 3) return null;
+  const gpuRows = output.slice(output.lastIndexOf(sections[1][0]) + sections[1][0].length, output.lastIndexOf(sections[2][0]))
+    .split(/\r?\n/).filter((line) => /^\s*\d+\s*,/.test(line));
+  if (!gpuRows.length || gpuRows.some((line) => csv(line).length !== 9)) return null;
+  // Discard the unfinished section, then close the remaining empty sections so
+  // the normal parser can reuse only complete, ordered observations.
+  const completed = output.slice(0, boundary) + sections.slice(lastSection).map(([marker]) => marker).join("\n") + "\n";
+  try {
+    return { ...parseProbe(completed, checkedAt), incompleteStage: sections[lastSection][1] };
+  } catch {
+    return null;
+  }
+}
+
 async function probe(node, requestedTimeoutMs = null) {
   const started = Date.now();
   try {
     let output;
     const timeoutMs = requestedTimeoutMs ?? (node.mode === "relay" ? RELAY_TIMEOUT_MS : SSH_TIMEOUT_MS);
-    const common = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"];
+    const common = sshOptions(timeoutMs);
     if (node.mode === "direct") {
       output = await run("ssh", [...common, "-p", String(node.port || 22), node.sshHost, remoteProbe], undefined, timeoutMs);
     } else {
       output = await runRelay(node, timeoutMs);
     }
-    const parsed = parseProbe(output);
-    return { nodeId: node.id, ok: true, checkedAt: new Date().toISOString(), latencyMs: Date.now() - started, ...parsed };
+    const checkedAt = new Date().toISOString();
+    const parsed = parseProbe(output, checkedAt);
+    return { nodeId: node.id, ok: true, checkedAt, latencyMs: Date.now() - started, ...parsed };
   } catch (error) {
+    const checkedAt = new Date().toISOString();
+    const partial = parseIncompleteProbe(error?.probeOutput, checkedAt);
+    if (partial) return {
+      nodeId: node.id, ok: true, partial: true, checkedAt, latencyMs: Date.now() - started, ...partial,
+      error: `采集在“${partial.incompleteStage}”阶段中断，已保留完整返回的 GPU 与进程数据。`,
+    };
     return { nodeId: node.id, ok: false, checkedAt: new Date().toISOString(), latencyMs: Date.now() - started, gpus: [], error: error instanceof Error ? error.message : String(error) };
   }
 }
@@ -1002,4 +1085,4 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   startApiServer();
 }
 
-export { buildContainerCwdQuery, containerCwdQuery, createApiServer, deviceQuery, mountInfoQuery, parseProbe, parseTimeoutMs, relayRemoteProbe, relayRemoteProbeSteps, relayShellReady, remoteProbe, run, runRelay, startApiServer };
+export { buildContainerCwdQuery, containerCwdQuery, createApiServer, deviceQuery, mountInfoQuery, parseIncompleteProbe, parseProbe, parseTimeoutMs, relayRemoteProbe, relayRemoteProbeSteps, relayShellReady, remoteProbe, run, runRelay, startApiServer, taskTimeQuery };

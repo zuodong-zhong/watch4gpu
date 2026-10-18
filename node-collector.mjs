@@ -1,3 +1,5 @@
+import { mergeNodeStatus } from "./lib/node-status.mjs";
+
 // A timeout change applies to the next collection; it must never create a
 // second SSH process for a target that is already being collected.
 function connectionKey(node) {
@@ -8,6 +10,17 @@ function connectionKey(node) {
 
 export function createNodeCollector(probe) {
   const pendingByNode = new Map();
+  const lastSuccessByNode = new Map();
+  async function collect(snapshot, key, timeoutMs) {
+    if (lastSuccessByNode.get(snapshot.id)?.key !== key) lastSuccessByNode.delete(snapshot.id);
+    const result = await probe(snapshot, timeoutMs);
+    const previous = lastSuccessByNode.get(snapshot.id)?.status;
+    if (result?.ok && !result.refreshFailed && (!result.partial || !previous || previous.partial)) {
+      lastSuccessByNode.set(snapshot.id, { key, status: result });
+    }
+    return result?.ok === false ? mergeNodeStatus(previous, result) : result;
+  }
+
   return function collectNode(node, timeoutMs = null) {
     const key = connectionKey(node);
     let queue = pendingByNode.get(node.id);
@@ -25,7 +38,7 @@ export function createNodeCollector(probe) {
     const entry = { key, promise: null };
     entry.promise = Promise.resolve(previous)
       .catch(() => {})
-      .then(() => probe(snapshot, timeoutMs))
+      .then(() => collect(snapshot, key, timeoutMs))
       .finally(() => {
         queue.splice(queue.indexOf(entry), 1);
         if (queue.length === 0) pendingByNode.delete(snapshot.id);
