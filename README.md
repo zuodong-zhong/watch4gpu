@@ -132,13 +132,7 @@ export WATCH4GPU_EXPECT_SCRIPT=/secure/path/connect.exp
 
 ### 用户显示名称
 
-姓名映射是可选功能。推荐在已被 Git 忽略的 `.env.local` 中设置：
-
-```dotenv
-NEXT_PUBLIC_WATCH4GPU_USER_NAMES={"alice":"Alice","bob":"Bob"}
-```
-
-公开默认值保存在 `data/user-names.json`，内容为空对象。配置格式为：
+直接编辑 `data/user-names.json`，一行填写一个“账户名”:“显示名称”。首次启动或构建时，程序会从公开的空模板 `data/user-names.example.json` 创建此文件；已有内容不会被覆盖。本地姓名文件已被 Git 忽略，不会随代码上传。配置格式为：
 
 ```json
 {
@@ -147,7 +141,9 @@ NEXT_PUBLIC_WATCH4GPU_USER_NAMES={"alice":"Alice","bob":"Bob"}
 }
 ```
 
-留空时页面直接显示服务器账号。`NEXT_PUBLIC_` 变量会进入本地前端页面，因此只能用于显示名称，不能放密码或令牌；姓名映射仍属于个人信息，不应提交到公开仓库。
+同一个人的多个账号可以填写相同名称；条目之间使用英文逗号，最后一条不加逗号。保存后开发页面会自动更新；若未更新，刷新页面即可。生产模式需要重新构建并启动。
+
+留空时使用 `{}`，页面直接显示服务器账号。程序只从此 JSON 文件读取姓名，不再读取 `NEXT_PUBLIC_WATCH4GPU_USER_NAMES`；旧配置可迁入此文件。姓名会显示在本地页面中，请勿在文件内填写密码或令牌，也不要强制提交真实姓名映射。
 
 节点列表上方的用户按钮默认为“全部用户”。选择某个人名后，页面只显示含有该用户进程的 GPU 卡片，并隐藏没有匹配 GPU 的节点；再次选择“全部用户”即可恢复完整视图。映射到同一显示名称的多个账号会合并为一个筛选项。
 
@@ -176,7 +172,6 @@ NEXT_PUBLIC_WATCH4GPU_USER_NAMES={"alice":"Alice","bob":"Bob"}
 | `WATCH4GPU_ALLOWED_ORIGINS` | 空 | 额外允许的网页来源，逗号分隔 |
 | `WATCH4GPU_CONFIG_FILE` | `data/nodes.local.json` | 本地节点配置文件路径 |
 | `NEXT_PUBLIC_WATCH4GPU_API_URL` | `http://127.0.0.1:8787` | 前端访问的 API 地址 |
-| `NEXT_PUBLIC_WATCH4GPU_USER_NAMES` | 空 | JSON 格式的账号到显示名称映射 |
 | `NEXT_PUBLIC_WATCH4GPU_MY_ACCOUNTS` | 空（使用本机账号） | 我的 GPU 默认服务器账号，支持逗号分隔的多个账号 |
 | `WATCH4GPU_USER_PATH_PREFIXES` | 空 | 用于推断进程归属的共享目录前缀，逗号分隔，例如 `/shared/users,/data/team` |
 | `WATCH4GPU_DEEP_INSPECTION_USERS` | 空（始终包含 `root`） | 需要触发容器只读深度归属检查的额外共享账户，逗号分隔 |

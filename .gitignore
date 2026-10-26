@@ -34,6 +34,7 @@ yarn-error.log*
 
 # local cluster configuration
 /data/*.local.json
+/data/user-names.json
 
 # vercel
 .vercel

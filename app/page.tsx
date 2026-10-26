@@ -106,17 +106,7 @@ type UserGpuFilterOption = {
 };
 
 const API = process.env.NEXT_PUBLIC_WATCH4GPU_API_URL || "http://127.0.0.1:8787";
-const USER_NAMES: Record<string, string> = (() => {
-  const configured = process.env.NEXT_PUBLIC_WATCH4GPU_USER_NAMES;
-  if (!configured) return userNames;
-  try {
-    const parsed = JSON.parse(configured);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return userNames;
-    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
-  } catch {
-    return userNames;
-  }
-})();
+const USER_NAMES: Record<string, string> = userNames;
 const DEFAULT_TIMEOUT_SECONDS = 90;
 const TIMEOUT_STORAGE_KEY = "watch4gpu.timeoutSeconds";
 const TIMEOUT_OPTIONS = [

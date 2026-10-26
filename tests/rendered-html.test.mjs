@@ -99,20 +99,23 @@ test("protects keyboard, mobile, and local development behavior", async () => {
 });
 
 test("keeps the public defaults free of private cluster configuration", async () => {
-  const [nodesText, namesText, page, server, readme, login] = await Promise.all([
+  const [nodesText, namesText, page, server, readme, login, gitignore] = await Promise.all([
     readFile(new URL("../data/nodes.json", import.meta.url), "utf8"),
-    readFile(new URL("../data/user-names.json", import.meta.url), "utf8"),
+    readFile(new URL("../data/user-names.example.json", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../README.md", import.meta.url), "utf8"),
     readFile(new URL("../login.sh", import.meta.url), "utf8"),
+    readFile(new URL("../.gitignore", import.meta.url), "utf8"),
   ]);
 
   assert.deepEqual(JSON.parse(nodesText), { nodes: [] });
   assert.deepEqual(JSON.parse(namesText), {});
   assert.match(server, /data", "nodes\.local\.json/);
   assert.match(server, /WATCH4GPU_USER_PATH_PREFIXES/);
-  assert.match(page, /NEXT_PUBLIC_WATCH4GPU_USER_NAMES/);
+  assert.match(page, /import userNames from "@\/data\/user-names\.json"/);
+  assert.doesNotMatch(page, /NEXT_PUBLIC_WATCH4GPU_USER_NAMES/);
+  assert.match(gitignore, /^\/data\/user-names\.json$/m);
   assert.match(login, /WATCH4GPU_EXPECT_SCRIPT/);
   assert.match(readme, /192\.0\.2\.10/);
 
