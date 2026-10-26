@@ -25,6 +25,10 @@ test("server-renders the real GPU dashboard shell", async () => {
   assert.match(html, /aria-label="搜索节点"/);
   assert.match(html, /aria-label="集群资源概览"/);
   assert.match(html, /按用户筛选：全部用户/);
+  assert.match(html, /role="switch"/);
+  assert.match(html, /aria-label="筛选显存占用低于 50% 的节点"/);
+  assert.match(html, /aria-label="显存阈值：50%"/);
+  assert.doesNotMatch(html, /aria-label="显存占用阈值（%）"/);
   assert.match(html, /我的 GPU/);
   assert.match(html, /正在连接本地采集服务/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|GPU OPERATIONS|LOCAL CONTROL ROOM/);
@@ -52,7 +56,7 @@ test("protects keyboard, mobile, and local development behavior", async () => {
   assert.match(page, /REFRESH_OPTIONS/);
   assert.match(page, /buildUserGpuFilterOptions/);
   assert.match(page, /selectedUserId/);
-  assert.match(page, /!selectedUser \|\| visibleGpus\.length > 0/);
+  assert.match(page, /!\(selectedUser \|\| lowMemoryOnly\) \|\| visibleGpus\.length > 0/);
   assert.match(page, /visibleGpus\.map\(\(gpu\) => <GpuTile/);
   assert.match(page, /显示全部用户/);
   assert.match(page, /new URLSearchParams\(\{ timeoutSeconds:/);
