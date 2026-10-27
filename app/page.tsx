@@ -4,6 +4,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import userNames from "@/data/user-names.json";
 import { createNodePoller } from "@/lib/node-poller.mjs";
 import { isCurrentStatus, mergeNodeStatus } from "@/lib/node-status.mjs";
+import { DEFAULT_MEMORY_THRESHOLD_PERCENT, MEMORY_THRESHOLD_OPTIONS, countLowMemoryGpus, filterNodeGpus, isValidMemoryThreshold } from "@/lib/node-gpu-filter.mjs";
 import ThemeToggle from "./theme-toggle";
 import MyGpus from "./my-gpus";
 
@@ -106,33 +107,25 @@ type UserGpuFilterOption = {
 };
 
 const API = process.env.NEXT_PUBLIC_WATCH4GPU_API_URL || "http://127.0.0.1:8787";
-const USER_NAMES: Record<string, string> = (() => {
-  const configured = process.env.NEXT_PUBLIC_WATCH4GPU_USER_NAMES;
-  if (!configured) return userNames;
-  try {
-    const parsed = JSON.parse(configured);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return userNames;
-    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
-  } catch {
-    return userNames;
-  }
-})();
+const USER_NAMES: Record<string, string> = userNames;
 const DEFAULT_TIMEOUT_SECONDS = 90;
 const TIMEOUT_STORAGE_KEY = "watch4gpu.timeoutSeconds";
+const MEMORY_THRESHOLD_STORAGE_KEY = "watch4gpu.memoryThresholdPercent";
 const TIMEOUT_OPTIONS = [
-  { seconds: 15, label: "快速" },
-  { seconds: 25, label: "标准" },
-  { seconds: 45, label: "稳妥" },
-  { seconds: 60, label: "宽松" },
-  { seconds: 90, label: "推荐中转" },
-  { seconds: 120, label: "最长" },
+  { value: 15, label: "快速" },
+  { value: 25, label: "标准" },
+  { value: 45, label: "稳妥" },
+  { value: 60, label: "宽松" },
+  { value: 90, label: "推荐中转" },
+  { value: 120, label: "最长" },
 ];
 const REFRESH_OPTIONS = [
-  { seconds: 10, label: "频繁" },
-  { seconds: 30, label: "标准" },
-  { seconds: 60, label: "省心" },
-  { seconds: 0, label: "手动" },
+  { value: 10, label: "频繁" },
+  { value: 30, label: "标准" },
+  { value: 60, label: "省心" },
+  { value: 0, label: "手动" },
 ];
+const MEMORY_OPTIONS = MEMORY_THRESHOLD_OPTIONS.map((value) => ({ value }));
 const emptyNode: NodeConfig = {
   id: "",
   name: "",
@@ -371,12 +364,15 @@ function WorkloadDetails({ workloads }: { workloads: WorkloadInfo[] }) {
   );
 }
 
-function CollectionPicker({
+function PresetPicker({
   id,
   label,
   value,
   options,
   icon,
+  unit = "秒",
+  description,
+  compact = false,
   helperText,
   disabled = false,
   onChange,
@@ -384,17 +380,20 @@ function CollectionPicker({
   id: string;
   label: string;
   value: number;
-  options: { seconds: number; label: string }[];
-  icon: "refresh" | "timeout";
+  options: { value: number; label?: string }[];
+  icon?: "refresh" | "timeout";
+  unit?: "秒" | "%";
+  description?: string;
+  compact?: boolean;
   helperText: string;
   disabled?: boolean;
-  onChange: (seconds: number) => void;
+  onChange: (value: number) => void;
 }) {
   const [open, setOpen] = useState(false);
   const controlRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const displayValue = value === 0 ? "暂停" : `${value} 秒`;
+  const displayValue = unit === "秒" ? value === 0 ? "暂停" : `${value} 秒` : `${value}%`;
 
   useEffect(() => {
     if (!open) return;
@@ -419,14 +418,14 @@ function CollectionPicker({
     };
   }, [open, value]);
 
-  function choose(seconds: number) {
-    onChange(seconds);
+  function choose(nextValue: number) {
+    onChange(nextValue);
     setOpen(false);
     window.requestAnimationFrame(() => triggerRef.current?.focus());
   }
 
-  return <div className="collection-picker" ref={controlRef}>
-    <span>{label}</span>
+  return <div className={`collection-picker ${compact ? "compact" : ""}`} ref={controlRef}>
+    {!compact && <span>{label}</span>}
     <button
       className="collection-trigger"
       type="button"
@@ -438,21 +437,21 @@ function CollectionPicker({
       aria-controls={id}
       onClick={() => setOpen((current) => !current)}
     >
-      <span className={`picker-icon ${icon}`} aria-hidden="true" />
-      <strong>{value === 0 ? "暂停" : <>{value}<small>秒</small></>}</strong>
+      {icon && <span className={`picker-icon ${icon}`} aria-hidden="true" />}
+      <strong>{unit === "秒" && value === 0 ? "暂停" : <>{value}<small>{unit}</small></>}</strong>
       <span className={`picker-chevron ${open ? "open" : ""}`} aria-hidden="true">⌄</span>
     </button>
     {open && <div className="collection-popover" id={id} ref={popoverRef} role="dialog" aria-label={`设置${label}`}>
-      <div className="collection-popover-copy"><strong>{label}</strong><span>{icon === "refresh" ? "每个节点采集完成后的等待时间" : "单个节点的最长等待时间"}</span></div>
+      <div className="collection-popover-copy"><strong>{label}</strong><span>{description || (icon === "refresh" ? "每个节点采集完成后的等待时间" : "单个节点的最长等待时间")}</span></div>
       <div className={`collection-options options-${options.length}`} role="group" aria-label={label}>
         {options.map((option) => <button
           type="button"
-          key={option.seconds}
-          data-value={option.seconds}
-          className={value === option.seconds ? "active" : ""}
-          aria-pressed={value === option.seconds}
-          onClick={() => choose(option.seconds)}
-        ><strong>{option.seconds === 0 ? "暂停" : <>{option.seconds}<small>秒</small></>}</strong><span>{option.label}</span></button>)}
+          key={option.value}
+          data-value={option.value}
+          className={value === option.value ? "active" : ""}
+          aria-pressed={value === option.value}
+          onClick={() => choose(option.value)}
+        ><strong>{unit === "秒" && option.value === 0 ? "暂停" : <>{option.value}<small>{unit}</small></>}</strong>{option.label && <span>{option.label}</span>}</button>)}
       </div>
       <p>{helperText}</p>
     </div>}
@@ -463,11 +462,13 @@ function UserFilter({
   options,
   value,
   allGpuCount,
+  wholeNodes = false,
   onChange,
 }: {
   options: UserGpuFilterOption[];
   value: string;
   allGpuCount: number;
+  wholeNodes?: boolean;
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -526,7 +527,7 @@ function UserFilter({
       <span className={`picker-chevron ${open ? "open" : ""}`} aria-hidden="true">⌄</span>
     </button>
     {open && <div className="user-filter-popover" id="user-filter-menu" ref={popoverRef} role="dialog" aria-label="选择要查看的用户">
-      <div className="user-filter-copy"><strong>按人名筛选</strong><span>只显示所选用户正在使用的 GPU</span></div>
+      <div className="user-filter-copy"><strong>按人名筛选</strong><span>{wholeNodes ? "筛选含该用户任务的节点，显示整节点 GPU" : "只显示所选用户正在使用的 GPU"}</span></div>
       <div className="user-filter-options" role="group" aria-label="用户">
         <button type="button" className={!value ? "active" : ""} aria-pressed={!value} onClick={() => choose("")}><span>全部用户</span><small>{allGpuCount} 块 GPU</small></button>
         {options.map((option) => <button type="button" key={option.id} className={value === option.id ? "active" : ""} aria-pressed={value === option.id} onClick={() => choose(option.id)}><span>{option.label}</span><small>{option.gpuCount} 块 GPU</small></button>)}
@@ -544,6 +545,8 @@ export default function Home() {
   const [statusError, setStatusError] = useState("");
   const [query, setQuery] = useState("");
   const [selectedUserId, setSelectedUserId] = useState("");
+  const [lowMemoryOnly, setLowMemoryOnly] = useState(false);
+  const [memoryThresholdPercent, setMemoryThresholdPercent] = useState(DEFAULT_MEMORY_THRESHOLD_PERCENT);
   const [intervalSeconds, setIntervalSeconds] = useState(30);
   const [timeoutSeconds, setTimeoutSeconds] = useState(DEFAULT_TIMEOUT_SECONDS);
   const [settingsReady, setSettingsReady] = useState(false);
@@ -601,9 +604,14 @@ export default function Home() {
     const timer = window.setTimeout(() => {
       try {
         const stored = Number(window.localStorage.getItem(TIMEOUT_STORAGE_KEY));
-        if (TIMEOUT_OPTIONS.some((option) => option.seconds === stored)) {
+        if (TIMEOUT_OPTIONS.some((option) => option.value === stored)) {
           timeoutSecondsRef.current = stored;
           setTimeoutSeconds(stored);
+        }
+        const storedMemoryThreshold = window.localStorage.getItem(MEMORY_THRESHOLD_STORAGE_KEY);
+        if (storedMemoryThreshold?.trim() && isValidMemoryThreshold(Number(storedMemoryThreshold))) {
+          const threshold = Number(storedMemoryThreshold);
+          setMemoryThresholdPercent(threshold);
         }
       } catch {
         // Local storage can be unavailable in privacy-restricted browser contexts.
@@ -709,18 +717,24 @@ export default function Home() {
   const rankedNodes = useMemo(() => filteredNodes.map((node) => {
     const status = statuses[node.id];
     const allNodeGpus = status?.ok ? status.gpus : [];
-    const visibleGpus = selectedUser ? allNodeGpus.filter((gpu) => gpuMatchesAccounts(gpu, selectedAccounts)) : allNodeGpus;
-    const visibleWorkloads = selectedUser ? (status?.workloads || []).filter((workload) => workloadMatchesAccounts(workload, selectedAccounts)) : status?.workloads || [];
+    const visibleGpus = filterNodeGpus(allNodeGpus, {
+      lowMemoryOnly,
+      memoryThresholdPercent,
+      matchesUser: selectedUser ? (gpu) => gpuMatchesAccounts(gpu, selectedAccounts) : undefined,
+    });
+    const visibleWorkloads = selectedUser && !lowMemoryOnly ? (status?.workloads || []).filter((workload) => workloadMatchesAccounts(workload, selectedAccounts)) : status?.workloads || [];
     const freeGpuCount = isCurrentStatus(status, now, staleAfter) ? visibleGpus.filter(isFreeGpu).length : 0;
-    return { node, originalIndex: nodes.indexOf(node), freeGpuCount, visibleGpus, visibleWorkloads };
-  }).filter(({ visibleGpus }) => !selectedUser || visibleGpus.length > 0)
-    .sort((a, b) => selectedUser
+    const lowMemoryGpuCount = countLowMemoryGpus(visibleGpus, memoryThresholdPercent);
+    return { node, originalIndex: nodes.indexOf(node), freeGpuCount, lowMemoryGpuCount, visibleGpus, visibleWorkloads };
+  }).filter(({ node, visibleGpus }) => (!lowMemoryOnly || node.enabled) && (!(selectedUser || lowMemoryOnly) || visibleGpus.length > 0))
+    .sort((a, b) => selectedUser && !lowMemoryOnly
       ? b.visibleGpus.length - a.visibleGpus.length || a.originalIndex - b.originalIndex
-      : b.freeGpuCount - a.freeGpuCount || a.originalIndex - b.originalIndex), [filteredNodes, nodes, selectedAccounts, selectedUser, statuses, now, staleAfter]);
+      : b.freeGpuCount - a.freeGpuCount || a.originalIndex - b.originalIndex), [filteredNodes, nodes, selectedAccounts, selectedUser, lowMemoryOnly, memoryThresholdPercent, statuses, now, staleAfter]);
   const onlineCount = enabledNodes.filter((node) => isCurrentStatus(statuses[node.id], now, staleAfter)).length;
   const freeGpuTotal = allGpus.filter(isFreeGpu).length;
   const occupiedGpuTotal = allGpus.length - freeGpuTotal;
   const visibleGpuTotal = rankedNodes.reduce((total, node) => total + node.visibleGpus.length, 0);
+  const lowMemoryGpuTotal = rankedNodes.reduce((total, node) => total + node.lowMemoryGpuCount, 0);
   const avgUtil = allGpus.length ? Math.round(allGpus.reduce((sum, gpu) => sum + gpu.utilization, 0) / allGpus.length) : 0;
   const lastChecked = enabledNodes.map((node) => statuses[node.id]?.checkedAt).filter(Boolean).sort().at(-1);
   const serviceError = statusError || configError;
@@ -797,6 +811,16 @@ export default function Home() {
     pollerRef.current?.setInterval(seconds * 1000);
   }
 
+  function chooseMemoryThreshold(threshold: number) {
+    if (!isValidMemoryThreshold(threshold)) return;
+    setMemoryThresholdPercent(threshold);
+    try {
+      window.localStorage.setItem(MEMORY_THRESHOLD_STORAGE_KEY, String(threshold));
+    } catch {
+      // Keep filtering with the chosen value if browser storage is unavailable.
+    }
+  }
+
   function nodeState(node: NodeConfig, status?: NodeStatus) {
     if (!node.enabled) return { label: "已停用", tone: "disabled" };
     if (!status) return { label: "正在连接", tone: "connecting" };
@@ -832,8 +856,8 @@ export default function Home() {
           <div><span>平均利用率</span><strong>{avgUtil}<small>%</small></strong></div>
         </div>
         <div className="collection-controls" aria-label="采集设置">
-          <CollectionPicker id="refresh-menu" label="刷新间隔" value={intervalSeconds} options={REFRESH_OPTIONS} icon="refresh" helperText="各节点独立刷新，采集结束后再等待所选时间。暂停后仍可使用顶部按钮手动刷新。" onChange={chooseInterval} />
-          <CollectionPicker id="timeout-menu" label="超时上限" value={timeoutSeconds} options={TIMEOUT_OPTIONS} icon="timeout" helperText="中转节点建议选择 90 秒，连接较慢时可用 120 秒。" disabled={!settingsReady} onChange={chooseTimeout} />
+          <PresetPicker id="refresh-menu" label="刷新间隔" value={intervalSeconds} options={REFRESH_OPTIONS} icon="refresh" helperText="各节点独立刷新，采集结束后再等待所选时间。暂停后仍可使用顶部按钮手动刷新。" onChange={chooseInterval} />
+          <PresetPicker id="timeout-menu" label="超时上限" value={timeoutSeconds} options={TIMEOUT_OPTIONS} icon="timeout" helperText="中转节点建议选择 90 秒，连接较慢时可用 120 秒。" disabled={!settingsReady} onChange={chooseTimeout} />
         </div>
       </section>
 
@@ -844,12 +868,24 @@ export default function Home() {
       <section className="section-head" aria-labelledby="nodes-heading">
         <div className="section-heading">
           <div>
-            <h2 id="nodes-heading">{selectedUser ? `${visibleGpuTotal} 块 ${selectedUser.label} 的 GPU` : query ? `${filteredNodes.length} 个匹配节点` : `${nodes.length} 个计算节点`}</h2>
-            <p>{selectedUser ? `${query ? `搜索“${query}” · ` : ""}只显示该用户对应的 GPU 卡片` : query ? `搜索“${query}”` : "按可用资源排序，空闲节点优先"}</p>
+            <div className="section-heading-row">
+              <h2 id="nodes-heading">{lowMemoryOnly ? `${rankedNodes.length} 个匹配节点 · ${visibleGpuTotal} 块 GPU` : selectedUser ? `${visibleGpuTotal} 块 ${selectedUser.label} 的 GPU` : query ? `${filteredNodes.length} 个匹配节点` : `${nodes.length} 个计算节点`}</h2>
+              {lowMemoryOnly && <span className="memory-match-count" role="status" aria-label="显存低于阈值的 GPU 数量" title="根据当前显示的 GPU 数据统计">显存 &lt; {memoryThresholdPercent}%：<strong>{lowMemoryGpuTotal}</strong> 块</span>}
+            </div>
+            <p id="nodes-filter-description">{lowMemoryOnly ? `${query ? `搜索“${query}” · ` : ""}${selectedUser ? `含 ${selectedUser.label} 的任务 · ` : ""}至少一张卡显存占用低于 ${memoryThresholdPercent}%，显示整节点全部 GPU` : selectedUser ? `${query ? `搜索“${query}” · ` : ""}只显示该用户对应的 GPU 卡片` : query ? `搜索“${query}”` : "按可用资源排序，空闲节点优先"}</p>
           </div>
         </div>
         <div className="section-tools">
-          <UserFilter options={userFilterOptions} value={selectedUserId} allGpuCount={knownGpus.length} onChange={setSelectedUserId} />
+          <div className={`memory-filter ${lowMemoryOnly ? "active" : ""}`} role="group" aria-label="显存筛选" title={`节点中任意一张卡的显存占用低于 ${memoryThresholdPercent}%，即显示该节点的全部 GPU`}>
+            <label className="toggle memory-filter-toggle">
+              <input type="checkbox" role="switch" checked={lowMemoryOnly} onChange={(event) => setLowMemoryOnly(event.target.checked)} aria-label={`筛选显存占用低于 ${memoryThresholdPercent}% 的节点`} aria-describedby="nodes-filter-description" />
+              <span aria-hidden="true" />
+              显存 &lt;
+            </label>
+            <PresetPicker id="memory-threshold-menu" label="显存阈值" value={memoryThresholdPercent} options={MEMORY_OPTIONS} unit="%" compact description="选择显存占用上限" helperText="任意一张卡显存占用低于所选比例，即显示该节点全部 GPU。" disabled={!settingsReady} onChange={chooseMemoryThreshold} />
+            <span>的节点</span>
+          </div>
+          <UserFilter options={userFilterOptions} value={selectedUserId} allGpuCount={knownGpus.length} wholeNodes={lowMemoryOnly} onChange={setSelectedUserId} />
           <div className={`availability-status ${freeGpuTotal ? "available" : allGpus.length ? "busy" : "pending"}`}>
             <span className="availability-dot" aria-hidden="true" />
             <span>{freeGpuTotal ? `${freeGpuTotal} 块 GPU 可立即使用` : allGpus.length ? "暂无空闲 GPU" : "等待资源数据"}</span>
@@ -862,9 +898,13 @@ export default function Home() {
 
         {!loading && serviceError && nodes.length === 0 && <div className="connection-state" role="alert"><span aria-hidden="true">!</span><h2>无法连接本地采集服务</h2><p>请确认 <code>npm run watch4gpu</code> 正在运行，然后重试。</p><button className="primary" onClick={() => { void loadNodes(); void refresh(); }}>重新连接</button></div>}
 
-        {!loading && !serviceError && !selectedUser && filteredNodes.length === 0 && <div className="empty-state"><span aria-hidden="true">◇</span><h2>{query ? "没有匹配的节点" : "还没有节点"}</h2><p>{query ? "换一个关键词，或清除搜索条件。" : "添加第一个计算节点，开始查看 GPU 状态。"}</p>{query ? <button onClick={() => setQuery("")}>清除搜索</button> : <button className="primary" onClick={openCreate}>添加节点</button>}</div>}
+        {!loading && !serviceError && !selectedUser && filteredNodes.length === 0 && !lowMemoryOnly && <div className="empty-state"><span aria-hidden="true">◇</span><h2>{query ? "没有匹配的节点" : "还没有节点"}</h2><p>{query ? "换一个关键词，或清除搜索条件。" : "添加第一个计算节点，开始查看 GPU 状态。"}</p>{query ? <button onClick={() => setQuery("")}>清除搜索</button> : <button className="primary" onClick={openCreate}>添加节点</button>}</div>}
 
-        {!loading && !serviceError && selectedUser && rankedNodes.length === 0 && <div className="empty-state"><span aria-hidden="true">◇</span><h2>没有找到 {selectedUser.label} 的 GPU</h2><p>{query ? "当前搜索范围内没有对应的 GPU 卡片。" : "该用户目前没有可识别的 GPU 进程。"}</p><button onClick={() => setSelectedUserId("")}>显示全部用户</button></div>}
+        {!loading && !serviceError && selectedUser && rankedNodes.length === 0 && !lowMemoryOnly && <div className="empty-state"><span aria-hidden="true">◇</span><h2>没有找到 {selectedUser.label} 的 GPU</h2><p>{query ? "当前搜索范围内没有对应的 GPU 卡片。" : "该用户目前没有可识别的 GPU 进程。"}</p><button onClick={() => setSelectedUserId("")}>显示全部用户</button></div>}
+
+        {!loading && lowMemoryOnly && rankedNodes.length === 0 && nodes.length > 0 && <div className="empty-state" role="status"><span aria-hidden="true">◇</span><h2>没有符合显存条件的节点</h2><p>当前筛选范围内，尚未采集到显存占用低于 {memoryThresholdPercent}% 的显卡。</p><button onClick={() => setLowMemoryOnly(false)}>关闭显存筛选</button></div>}
+
+        {!loading && !serviceError && lowMemoryOnly && nodes.length === 0 && <div className="empty-state"><span aria-hidden="true">◇</span><h2>还没有节点</h2><p>添加第一个计算节点，开始查看 GPU 状态。</p><button className="primary" onClick={openCreate}>添加节点</button></div>}
 
         {rankedNodes.map(({ node, originalIndex, freeGpuCount, visibleGpus, visibleWorkloads }) => {
           const status = statuses[node.id];
@@ -880,7 +920,7 @@ export default function Home() {
               {!node.enabled ? <div className="state-message"><strong>这个节点已停用</strong><p>编辑节点可重新启用自动采集。</p></div> : status?.ok ? <>
                 {state.tone === "stale" && <div className="node-refresh-warning" role="status"><div><strong>{partial ? "已显示本次采集到的 GPU 数据" : "保留上次采集的数据"}</strong><p>{status.error || "数据已过期，等待重新采集。"}</p><p>{partial ? "本次详情采集尚未完成，暂不计入当前可用资源。" : "以下为历史快照，不计入当前可用资源。"}</p></div><button onClick={() => void refresh(node.id)}>重新尝试</button></div>}
                 <div className="node-summary">
-                  <div>{state.tone === "stale" ? <><strong>{visibleGpus.length}</strong><span>块 GPU · {partial ? "部分数据" : "上次记录"}</span></> : selectedUser ? <><strong>{visibleGpus.length}</strong><span>块 {selectedUser.label} 的 GPU</span></> : <><strong>{freeGpuCount}</strong><span>/ {visibleGpus.length} 块可用</span></>}</div>
+                  <div>{state.tone === "stale" ? <><strong>{visibleGpus.length}</strong><span>块 GPU · {partial ? "部分数据" : "上次记录"}</span></> : selectedUser && !lowMemoryOnly ? <><strong>{visibleGpus.length}</strong><span>块 {selectedUser.label} 的 GPU</span></> : <><strong>{freeGpuCount}</strong><span>/ {visibleGpus.length} 块可用</span></>}</div>
                   <p><span>{status.latencyMs} ms</span><span>{status.hostname || node.name}</span><span>{relativeTime(status.checkedAt, now)}更新</span></p>
                 </div>
                 <WorkloadDetails workloads={visibleWorkloads} />
