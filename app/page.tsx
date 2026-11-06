@@ -8,6 +8,7 @@ import { compareNodeResources, isFreeGpu, nodeSortMetrics } from "@/lib/node-sor
 import { DEFAULT_MEMORY_THRESHOLD_PERCENT, MEMORY_THRESHOLD_OPTIONS, buildGpuTypeOptions, countLowMemoryGpus, filterNodeGpus, isValidMemoryThreshold } from "@/lib/node-gpu-filter.mjs";
 import ThemeToggle from "./theme-toggle";
 import MyGpus from "./my-gpus";
+import StorageCapsule, { type StorageCapsuleHandle } from "./storage";
 import UiIcon from "./ui-icon";
 
 type NodeMode = "direct" | "relay";
@@ -574,6 +575,7 @@ export default function Home() {
   const nodesRef = useRef<NodeConfig[]>([]);
   const failedRequestsRef = useRef(new Set<string>());
   const pollerRef = useRef<ReturnType<typeof createNodePoller<NodeConfig, NodeStatus>> | null>(null);
+  const storageRef = useRef<StorageCapsuleHandle>(null);
 
   const applyNodes = useCallback((next: NodeConfig[]) => {
     const previous = new Map(nodesRef.current.map((node) => [node.id, JSON.stringify(node)]));
@@ -613,7 +615,7 @@ export default function Home() {
     if (manualRefreshing || !pollerRef.current) return;
     setManualRefreshing(true);
     try {
-      await refresh();
+      await Promise.all([refresh(), storageRef.current?.refresh()]);
     } finally {
       setManualRefreshing(false);
     }
@@ -880,7 +882,7 @@ export default function Home() {
         <label className="search"><UiIcon name="search" /><input aria-label="搜索节点" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索节点、IP 或编号" /></label>
         <div className="top-actions">
           <ThemeToggle />
-          <button className="icon-button refresh-button" onClick={() => void refreshAll()} disabled={!settingsReady || loading || manualRefreshing} aria-busy={manualRefreshing} aria-label="刷新全部节点" title={manualRefreshing ? "正在刷新全部节点…" : "刷新全部节点"}><UiIcon name="refresh" /></button>
+          <button className="icon-button refresh-button" onClick={() => void refreshAll()} disabled={!settingsReady || loading || manualRefreshing} aria-busy={manualRefreshing} aria-label="刷新全部资源" title={manualRefreshing ? "正在刷新节点与磁盘…" : "刷新全部节点与常用盘"}><UiIcon name="refresh" /></button>
           <button className="primary add-button" onClick={openCreate}><UiIcon name="plus" /><span className="button-text">添加节点</span></button>
         </div>
       </header>
@@ -917,14 +919,17 @@ export default function Home() {
           </div>
         </div>
         <div className="section-tools">
-          <div className={`memory-filter ${lowMemoryOnly ? "active" : ""}`} role="group" aria-label="显存筛选" title={`所选卡型中任意一张卡的显存占用低于 ${memoryThresholdPercent}%，即显示该节点内符合卡型的全部 GPU`}>
-            <label className="toggle memory-filter-toggle">
-              <input type="checkbox" role="switch" checked={lowMemoryOnly} onChange={(event) => setLowMemoryOnly(event.target.checked)} aria-label={`筛选显存占用低于 ${memoryThresholdPercent}% 的节点`} aria-describedby="nodes-filter-description" />
-              <span aria-hidden="true" />
-              显存 &lt;
-            </label>
-            <PresetPicker id="memory-threshold-menu" label="显存阈值" value={memoryThresholdPercent} options={MEMORY_OPTIONS} unit="%" compact description="选择显存占用上限" helperText="所选卡型中任意一张卡低于阈值，即显示该节点内符合卡型的全部 GPU。" disabled={!settingsReady} onChange={chooseMemoryThreshold} />
-            <span>的节点</span>
+          <div className="memory-storage-tools">
+            <div className={`memory-filter ${lowMemoryOnly ? "active" : ""}`} role="group" aria-label="显存筛选" title={`所选卡型中任意一张卡的显存占用低于 ${memoryThresholdPercent}%，即显示该节点内符合卡型的全部 GPU`}>
+              <label className="toggle memory-filter-toggle">
+                <input type="checkbox" role="switch" checked={lowMemoryOnly} onChange={(event) => setLowMemoryOnly(event.target.checked)} aria-label={`筛选显存占用低于 ${memoryThresholdPercent}% 的节点`} aria-describedby="nodes-filter-description" />
+                <span aria-hidden="true" />
+                显存 &lt;
+              </label>
+              <PresetPicker id="memory-threshold-menu" label="显存阈值" value={memoryThresholdPercent} options={MEMORY_OPTIONS} unit="%" compact description="选择显存占用上限" helperText="所选卡型中任意一张卡低于阈值，即显示该节点内符合卡型的全部 GPU。" disabled={!settingsReady} onChange={chooseMemoryThreshold} />
+              <span>的节点</span>
+            </div>
+            <StorageCapsule ref={storageRef} api={API} ready={settingsReady} intervalSeconds={intervalSeconds} timeoutSeconds={timeoutSeconds} now={now} />
           </div>
           <GpuFilterPicker kind="type" options={gpuTypeOptions.map(({ type, gpuCount }) => ({ id: type, label: type, gpuCount }))} value={selectedGpuType} allGpuCount={knownGpus.length} onChange={chooseGpuType} />
           <GpuFilterPicker kind="user" options={userFilterOptions} value={selectedUserId} allGpuCount={knownGpus.length} wholeNodes={lowMemoryOnly} onChange={setSelectedUserId} />

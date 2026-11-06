@@ -32,6 +32,8 @@ test("server-renders the real GPU dashboard shell", async () => {
   assert.match(html, /aria-label="显存阈值：50%"/);
   assert.doesNotMatch(html, /aria-label="显存占用阈值（%）"/);
   assert.match(html, /我的 GPU/);
+  assert.match(html, /常用盘空间/);
+  assert.match(html, /aria-expanded="false" aria-controls="storage-popover"/);
   assert.match(html, /正在连接本地采集服务/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|GPU OPERATIONS|LOCAL CONTROL ROOM/);
 });

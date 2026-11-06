@@ -1,12 +1,13 @@
 # GPU Watch
 
-GPU Watch 是一个本地优先的 GPU 集群监控面板。它通过你已有的 SSH 配置读取 NVIDIA GPU、训练进程和资源占用信息；数据保留在运行面板的电脑上，不依赖云端服务。
+GPU Watch 是一个本地优先的 GPU 集群监控面板。它通过你已有的 SSH 配置读取 NVIDIA GPU、训练进程和常用磁盘的可用空间；数据保留在运行面板的电脑上，不依赖云端服务。
 
 > 重要：本仓库不包含任何真实服务器地址、SSH 账号、姓名映射、密码或私钥。首次运行后，请按下文配置自己的环境。
 
 ## 功能
 
 - 展示节点在线状态，以及每块 GPU 的利用率、显存、温度和功耗
+- 显存筛选右侧的“常用盘”胶囊可展开共享盘与系统盘的可用空间、总容量、使用比例和采集时间；支持独立刷新、低余量提醒和失败时保留历史读数
 - 展示计算进程的账号、PID、运行时长和显存占用
 - 可按人名筛选，只显示该用户正在使用的 GPU 卡片
 - 可按卡型筛选（如 A100、A800、A6000），选项及数量来自已采集数据；卡型保留在 URL，刷新页面后继续生效
@@ -32,13 +33,14 @@ GPU Watch 是一个本地优先的 GPU 集群监控面板。它通过你已有�
 - npm
 - 本机可用的 OpenSSH 客户端
 - 目标服务器已安装 NVIDIA 驱动，并可执行 `nvidia-smi`
+- 启用常用盘监控时，所选 Linux 登录机需提供 GNU `df` 和 `timeout`，并已挂载要查看的磁盘
 - 推荐使用 SSH key 或 ssh-agent；采集过程使用 `BatchMode=yes`，不会弹出密码输入框
 - 中转模式若使用本仓库的 `login.sh` 模板，还需要在网关安装 `expect`
 
 ## 快速开始
 
 ```bash
-git clone https://github.com/<your-account>/watch4gpu.git
+git clone https://github.com/zuodong-zhong/watch4gpu.git
 cd watch4gpu
 npm ci
 npm run watch4gpu
@@ -104,6 +106,43 @@ export WATCH4GPU_EXPECT_SCRIPT=/secure/path/connect.exp
 共享存储响应较慢时，兼容通道将本次新建客户端的命令确认等待延长到 15 秒，沿用同一消息和总采集超时，不增加连接会话。
 
 旧式 `login.sh` / `login_1.sh` 的客户端启动等待会在当前会话中适配所选超时，避免网关身份验证超过 30 秒时被脚本反复中断；交互和兼容通道均适用，远端脚本保持不变。页面和中转采集默认等待 90 秒，较慢时可选 120 秒；所选时间仍是整次采集的上限。
+
+## 配置常用盘空间
+
+先在 `~/.ssh/config` 中配置可免交互登录的 Host 别名，再复制 [存储配置模板](data/storage.example.json)。以下命令不会覆盖已有的本地配置：
+
+```bash
+cp -n data/storage.example.json data/storage.local.json
+```
+
+编辑 `data/storage.local.json`，将 SSH 别名和挂载路径替换为自己的环境：
+
+```json
+{
+  "sshHost": "storage-gateway",
+  "disks": [
+    { "label": "共享数据盘", "path": "/shared" },
+    { "label": "系统盘", "path": "/" }
+  ]
+}
+```
+
+连接完全沿用 `~/.ssh/config` 中该别名的用户、端口、密钥和跳板设置。目标为 Linux，需提供 GNU `df` 和 `timeout`。配置文件已被 Git 忽略；修改后下次刷新立即生效。未配置时不会发起存储 SSH 连接。
+
+页面在显存筛选右侧提供“常用盘”胶囊，点击展开容量详情，点击外部或按 Escape 收起。展开不推动节点列表，关闭后仍按原间隔采集；按 Escape 关闭时，键盘焦点返回胶囊。
+
+详情使用二进制容量单位（GiB / TiB / PiB），突出显示 `df` 返回的可用空间；可用空间包含文件系统预留规则，可能不同于总容量减去已用容量。这些是文件系统整体余量，不是个人目录大小或用户配额。
+
+| 读数状态 | 页面提示 |
+| --- | --- |
+| 剩余空间不超过 10% | “余量偏低”，容量标橙色 |
+| 剩余空间不超过 5% | “空间紧张”，容量标红色 |
+| 存在当前有效的低余量读数 | 胶囊显示红色提示圆点 |
+| 已有成功读数过期或刷新失败 | 标明“上次记录”和原采集时间；没有有效低余量读数时，胶囊显示灰色圆点 |
+
+存储与 GPU 独立采集，共用页面刷新间隔和总超时设置；可点击“刷新磁盘”单独更新，顶部刷新按钮也会更新磁盘。相同配置的进行中采集会复用。每个磁盘仅执行固定只读 `df` 查询，最多等待 8 秒，不扫描目录；单盘失败不覆盖其他盘的有效读数。指定路径必须是实际挂载点，未挂载时不会误报系统盘容量。刷新失败时保留各盘上次成功的数值和原始时间，并标明历史记录；服务重启后内存快照清空。
+
+如需使用其他配置文件路径，可设置 `WATCH4GPU_STORAGE_CONFIG_FILE`。要停用存储采集，将本地配置改为 `{ "sshHost": "", "disks": [] }`。升级后若页面提示重启采集服务，请重新运行 `npm run watch4gpu`。
 
 ## 节点与姓名映射
 
@@ -207,6 +246,7 @@ export WATCH4GPU_EXPECT_SCRIPT=/secure/path/connect.exp
 | `WATCH4GPU_RELAY_TIMEOUT_MS` | `90000` | 中转连接超时毫秒数 |
 | `WATCH4GPU_ALLOWED_ORIGINS` | 空 | 额外允许的网页来源，逗号分隔 |
 | `WATCH4GPU_CONFIG_FILE` | `data/nodes.local.json` | 本地节点配置文件路径 |
+| `WATCH4GPU_STORAGE_CONFIG_FILE` | `data/storage.local.json` | 本地常用盘配置文件路径 |
 | `NEXT_PUBLIC_WATCH4GPU_API_URL` | `http://127.0.0.1:8787` | 前端访问的 API 地址 |
 | `NEXT_PUBLIC_WATCH4GPU_MY_ACCOUNTS` | 空（使用本机账号） | 我的 GPU 默认服务器账号，支持逗号分隔的多个账号 |
 | `WATCH4GPU_USER_PATH_PREFIXES` | 空 | 用于推断进程归属的共享目录前缀，逗号分隔，例如 `/shared/users,/data/team` |
