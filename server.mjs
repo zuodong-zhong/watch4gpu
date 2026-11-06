@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createNodeCollector } from "./node-collector.mjs";
 import { sshOptions } from "./lib/ssh-options.mjs";
+import { createStorageCollector, readStorageConfig } from "./lib/storage.mjs";
 import { buildRelayLogin, buildRelayCommandProbe, relayCommandReadyMarker, relayClientStartedMarker } from "./lib/relay-command.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -1016,8 +1017,9 @@ async function probe(node, requestedTimeoutMs = null) {
 }
 
 const collectNodeStatus = createNodeCollector(probe);
+const collectStorageStatus = createStorageCollector(run);
 
-function createApiServer({ getConfig = readConfig, collectNode = collectNodeStatus, getAccount = () => userInfo().username } = {}) {
+function createApiServer({ getConfig = readConfig, collectNode = collectNodeStatus, getAccount = () => userInfo().username, getStorageConfig = readStorageConfig, collectStorage = collectStorageStatus } = {}) {
   return createServer(async (request, response) => {
     const origin = request.headers.origin;
     if (origin && isAllowedOrigin(origin)) {
@@ -1030,6 +1032,10 @@ function createApiServer({ getConfig = readConfig, collectNode = collectNodeStat
       if (request.method === "GET" && url.pathname === "/api/health") return json(response, 200, { ok: true });
       if (request.method === "GET" && url.pathname === "/api/profile") return json(response, 200, { account: getAccount() });
       if (request.method === "GET" && url.pathname === "/api/nodes") return json(response, 200, await getConfig());
+      if (request.method === "GET" && url.pathname === "/api/storage") {
+        const timeoutMs = parseTimeoutMs(url.searchParams.get("timeoutSeconds"));
+        return json(response, 200, await collectStorage(await getStorageConfig(), timeoutMs));
+      }
       if (request.method === "GET" && url.pathname === "/api/status") {
         const config = await getConfig();
         const requestedNode = url.searchParams.get("node");

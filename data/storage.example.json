@@ -1,0 +1,7 @@
+{
+  "sshHost": "storage-gateway",
+  "disks": [
+    { "label": "共享数据盘", "path": "/shared" },
+    { "label": "系统盘", "path": "/" }
+  ]
+}
