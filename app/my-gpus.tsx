@@ -5,19 +5,21 @@ import { resolveMyAccounts, summarizeMyGpus, type MyNode, type MyStatus } from "
 import { formatShanghaiTime } from "@/lib/task-time.mjs";
 import MyTasks from "./my-tasks";
 import NodeTaskSummary from "./node-task-summary";
+import UiIcon from "./ui-icon";
 import { summarizeMyTasks, summarizeNodeTaskDescriptions } from "@/lib/my-tasks.mjs";
 
 const STORAGE_KEY = "watch4gpu.myAccounts";
 const COLLAPSED_STORAGE_KEY = "watch4gpu.myGpusCollapsed";
 const DEFAULT_ACCOUNTS = [...resolveMyAccounts(process.env.NEXT_PUBLIC_WATCH4GPU_MY_ACCOUNTS || "", {})].join(", ");
 
-export default function MyGpus({ nodes, statuses, names, api, now, staleAfter }: {
+export default function MyGpus({ nodes, statuses, names, api, now, staleAfter, onAccountsChange }: {
   nodes: MyNode[];
   statuses: Record<string, MyStatus>;
   names: Record<string, string>;
   api: string;
   now: number;
   staleAfter: number;
+  onAccountsChange: (accounts: ReadonlySet<string>) => void;
 }) {
   const [identity, setIdentity] = useState("");
   const [draft, setDraft] = useState("");
@@ -58,6 +60,7 @@ export default function MyGpus({ nodes, statuses, names, api, now, staleAfter }:
   }, [api]);
 
   const accounts = useMemo(() => resolveMyAccounts(identity, names), [identity, names]);
+  useEffect(() => { onAccountsChange(accounts); }, [accounts, onAccountsChange]);
   const summary = useMemo(() => summarizeMyGpus(nodes, statuses, accounts, now, staleAfter), [nodes, statuses, accounts, now, staleAfter]);
   const taskGroups = useMemo(() => summarizeMyTasks(nodes, statuses, accounts, now, staleAfter), [nodes, statuses, accounts, now, staleAfter]);
   const nodeTaskDescriptions = useMemo(() => new Map(taskGroups.map(({ node, tasks }) => [node.id, summarizeNodeTaskDescriptions(tasks)])), [taskGroups]);
@@ -78,15 +81,24 @@ export default function MyGpus({ nodes, statuses, names, api, now, staleAfter }:
     try { window.localStorage.setItem(COLLAPSED_STORAGE_KEY, String(value)); } catch { /* Keep the session choice. */ }
   }
 
-  return <section className="my-gpus" aria-labelledby="my-gpus-title">
+  return <section className={`my-gpus${collapsed ? " is-collapsed" : ""}`} aria-labelledby="my-gpus-title">
     <div className="my-gpus-heading">
-      <div><h2 id="my-gpus-title">我的 GPU</h2><p>{!ready ? "正在读取账号设置…" : accounts.size ? <span title={[...accounts].join("、")}>{displayNames} · 按进程归属匹配</span> : "设置服务器账号，查看自己正在使用的卡"}</p></div>
-      {ready && <div className="my-gpus-actions">
-        <button type="button" onClick={() => { changeCollapsed(false); setDraft(identity); setEditing((value) => !value); }} aria-expanded={editing} aria-controls="my-accounts-form">{editing ? "收起设置" : "修改账号"}</button>
-        <button type="button" onClick={() => changeCollapsed(!collapsed)} aria-expanded={!collapsed} aria-controls="my-gpus-details">{collapsed ? "展开" : "收起"}<span className={`picker-chevron ${collapsed ? "" : "open"}`} aria-hidden="true">⌄</span></button>
+      <div className="my-gpus-summary">
+        <div className="my-gpus-identity">
+          <h2 id="my-gpus-title">我的 GPU</h2>
+          <p>{!ready ? "正在读取账号设置…" : accounts.size ? <span title={`按进程归属匹配：${[...accounts].join("、")}`}>
+            {displayNames}
+          </span> : "设置服务器账号，查看自己正在使用的卡"}</p>
+        </div>
+        {ready && accounts.size > 0 && <div className="my-gpus-count" role="status"><strong>{summary.matchedCount}</strong><span>块匹配 GPU</span>{summary.uncertainCount > 0 && <span className="my-gpus-uncertain">另有 {summary.uncertainCount} 块归属待确认</span>}</div>}
+      </div>
+      {ready && <div className="my-gpus-toolbar">
+        <div className="my-gpus-actions">
+          <button type="button" onClick={() => { changeCollapsed(false); setDraft(identity); setEditing((value) => !value); }} aria-expanded={editing} aria-controls="my-accounts-form">{editing ? "收起设置" : "修改账号"}</button>
+          <button type="button" onClick={() => changeCollapsed(!collapsed)} aria-expanded={!collapsed} aria-controls="my-gpus-details">{collapsed ? "展开" : "收起"}<UiIcon name="chevron-down" className={`picker-chevron ${collapsed ? "" : "open"}`} /></button>
+        </div>
       </div>}
     </div>
-    {ready && accounts.size > 0 && <div className="my-gpus-count" role="status"><strong>{summary.matchedCount}</strong><span>块匹配 GPU</span>{summary.uncertainCount > 0 && <span className="my-gpus-uncertain">另有 {summary.uncertainCount} 块归属待确认</span>}{collapsed && summary.unavailableNodes > 0 && <span>{summary.unavailableNodes} 个节点待更新</span>}</div>}
     <div id="my-gpus-details" hidden={collapsed}>
     {editing && <form id="my-accounts-form" className="my-accounts-form" onSubmit={save}>
       <label htmlFor="my-accounts">我的服务器账号（可多个）</label>

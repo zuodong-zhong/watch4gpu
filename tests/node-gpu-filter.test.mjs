@@ -1,11 +1,49 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MEMORY_THRESHOLD_OPTIONS, countLowMemoryGpus, filterNodeGpus, isValidMemoryThreshold } from "../lib/node-gpu-filter.mjs";
+import { MEMORY_THRESHOLD_OPTIONS, buildGpuTypeOptions, countLowMemoryGpus, filterNodeGpus, getGpuType, isValidMemoryThreshold } from "../lib/node-gpu-filter.mjs";
 
 const gpu = (memoryUsed, overrides = {}) => ({ memoryUsed, memoryTotal: 10000, ...overrides });
 const cards = () => Array.from({ length: 8 }, (_, index) => gpu(9000, { index, user: index === 0 ? "alice" : "bob" }));
 const lowMemory = { lowMemoryOnly: true };
 const matchesAlice = (card) => card.user === "alice";
+
+test("GPU type options group A-series variants without conflating other RTX models", () => {
+  const gpus = [
+    "NVIDIA A100-SXM4-80GB", "NVIDIA A100-PCIE-40GB", "NVIDIA A800 80GB PCIe",
+    "NVIDIA RTX A6000", "  NVIDIA   RTX A6000  ", "NVIDIA RTX 6000 Ada Generation", "NVIDIA H100 PCIe", "",
+  ].map((name) => ({ name }));
+  assert.deepEqual(buildGpuTypeOptions(gpus), [
+    { type: "A100", gpuCount: 2 }, { type: "A800", gpuCount: 1 }, { type: "A6000", gpuCount: 2 },
+    { type: "H100 PCIe", gpuCount: 1 }, { type: "RTX 6000 Ada Generation", gpuCount: 1 },
+  ]);
+  assert.equal(getGpuType("nvidia a100-sxm4-80gb"), "A100");
+  assert.equal(getGpuType(), "");
+  assert.deepEqual(buildGpuTypeOptions([]), []);
+});
+
+test("an idle GPU of another type cannot satisfy memory or user filters", () => {
+  const gpus = [gpu(9000, { name: "NVIDIA A100-SXM4-80GB", user: "bob" }), gpu(0, { name: "NVIDIA RTX A6000", user: "alice" })];
+  const before = structuredClone(gpus);
+  assert.deepEqual(filterNodeGpus(gpus, { gpuType: "A100" }), [gpus[0]]);
+  assert.deepEqual(filterNodeGpus(gpus, { gpuType: "A100", ...lowMemory }), []);
+  assert.deepEqual(filterNodeGpus(gpus, { gpuType: "A100", matchesUser: matchesAlice }), []);
+  assert.deepEqual(filterNodeGpus(gpus, { gpuType: "A800" }), []);
+  assert.deepEqual(filterNodeGpus(gpus, { gpuType: "A6000", ...lowMemory, matchesUser: matchesAlice }), [gpus[1]]);
+  assert.strictEqual(filterNodeGpus(gpus, { gpuType: "" }), gpus);
+  assert.deepEqual(gpus, before);
+});
+
+test("memory filtering retains every sibling of the selected type, and only that type", () => {
+  const gpus = [
+    gpu(9000, { name: "NVIDIA A100-SXM4-80GB", user: "alice" }),
+    gpu(1000, { name: "NVIDIA A100-PCIE-40GB", user: "bob" }),
+    gpu(0, { name: "NVIDIA RTX A6000", user: "alice" }),
+  ];
+  const visible = filterNodeGpus(gpus, { gpuType: "A100", ...lowMemory, matchesUser: matchesAlice });
+  assert.deepEqual(visible, gpus.slice(0, 2));
+  assert.equal(countLowMemoryGpus(visible), 1);
+  assert.deepEqual(filterNodeGpus(gpus, { gpuType: "A100", matchesUser: matchesAlice }), [gpus[0]]);
+});
 
 test("one card below 50% keeps all eight GPUs in their original order", () => {
   const gpus = cards();
